@@ -5,6 +5,8 @@ from socket import AF_INET, SOCK_DGRAM, SOCK_STREAM, socket, timeout
 from struct import pack, unpack
 import codecs
 
+from asyncio.exceptions import CancelledError
+
 from . import const
 from .attendance import Attendance
 from .exception import ZKErrorConnection, ZKErrorResponse, ZKNetworkError
@@ -111,7 +113,7 @@ class ZK(object):
     """
     ZK main class
     """
-    def __init__(self, ip, port=4370, timeout=60, password=0, force_udp=False, ommit_ping=False, verbose=False, encoding='UTF-8'):
+    def __init__(self, ip, port=4370, timeout=60, password=0, ommit_ping=False, verbose=False, encoding='UTF-8'):
         """
         Construct a new 'ZK' object.
 
@@ -126,8 +128,8 @@ class ZK(object):
         """
         User.encoding = encoding
         self.__address = (ip, port)
-        self.__sock = socket(AF_INET, SOCK_DGRAM)
-        self.__sock.settimeout(timeout)
+        # self.__sock = socket(AF_INET, SOCK_DGRAM)
+        # self.__sock.settimeout(timeout)
         self.__timeout = timeout
         self.__password = password # passint
         self.__session_id = 0
@@ -135,14 +137,15 @@ class ZK(object):
         self.__data_recv = None
         self.__data = None
         self.__live_event = asyncio.Event()
+        self.__live_event_closed = asyncio.Event()
         self.is_connect = False
         self.is_enabled = True
         self.helper = ZK_helper(ip, port)
-        self.force_udp = force_udp
+        self.force_udp = False
         self.ommit_ping = ommit_ping
         self.verbose = verbose
         self.encoding = encoding
-        self.tcp = not force_udp
+        self.tcp = True
         self.users = 0
         self.fingers = 0
         self.records = 0
@@ -167,15 +170,9 @@ class ZK(object):
         """
         return self.is_connect
 
-    def __create_socket(self):
-        if self.tcp:
-            self.__sock = socket(AF_INET, SOCK_STREAM)
-            self.__sock.settimeout(self.__timeout)
-            self.__sock.connect_ex(self.__address)
-        else:
-            self.__sock = socket(AF_INET, SOCK_DGRAM)
-            self.__sock.settimeout(self.__timeout)
-
+    async def __create_socket(self):
+        self.__sock_reader, self.__sock_writer = await asyncio.open_connection(self.__address[0], self.__address[1])
+        
     def __create_tcp_top(self, packet):
         """
         witch the complete packet set top header
@@ -235,7 +232,7 @@ class ZK(object):
             return tcp_header[2]
         return 0
 
-    def __send_command(self, command, command_string=b'', response_size=8):
+    async def __send_command(self, command, command_string=b'', response_size=8):
         """
         send command to the terminal
         """
@@ -244,19 +241,15 @@ class ZK(object):
 
         buf = self.__create_header(command, command_string, self.__session_id, self.__reply_id)
         try:
-            if self.tcp:
-                top = self.__create_tcp_top(buf)
-                self.__sock.send(top)
-                self.__tcp_data_recv = self.__sock.recv(response_size + 8)
-                self.__tcp_length = self.__test_tcp_top(self.__tcp_data_recv)
-                if self.__tcp_length == 0:
-                    raise ZKNetworkError("TCP packet invalid")
-                self.__header = unpack('<4H', self.__tcp_data_recv[8:16])
-                self.__data_recv = self.__tcp_data_recv[8:]
-            else:
-                self.__sock.sendto(buf, self.__address)
-                self.__data_recv = self.__sock.recv(response_size)
-                self.__header = unpack('<4H', self.__data_recv[:8])
+            top = self.__create_tcp_top(buf)
+            self.__sock_writer.write(top)
+            await self.__sock_writer.drain()
+            self.__tcp_data_recv = await self.__sock_reader.read(response_size + 8)
+            self.__tcp_length = self.__test_tcp_top(self.__tcp_data_recv)
+            if self.__tcp_length == 0:
+                raise ZKNetworkError("TCP packet invalid")
+            self.__header = unpack('<4H', self.__tcp_data_recv[8:16])
+            self.__data_recv = self.__tcp_data_recv[8:]
         except Exception as e:
             raise ZKNetworkError(str(e))
 
@@ -273,17 +266,15 @@ class ZK(object):
             'code': self.__response
         }
 
-    def __ack_ok(self):
+    async def __ack_ok(self):
         """
         event ack ok
         """
         buf = self.__create_header(const.CMD_ACK_OK, b'', self.__session_id, const.USHRT_MAX - 1)
         try:
-            if self.tcp:
-                top = self.__create_tcp_top(buf)
-                self.__sock.send(top)
-            else:
-                self.__sock.sendto(buf, self.__address)
+            top = self.__create_tcp_top(buf)
+            self.__sock_writer.write(top)
+            await self.__sock_writer.drain()
         except Exception as e:
             raise ZKNetworkError(str(e))
 
@@ -357,7 +348,7 @@ class ZK(object):
         )
         return d
 
-    def connect(self):
+    async def connect(self):
         """
         connect to the device
 
@@ -368,15 +359,15 @@ class ZK(object):
             raise ZKNetworkError("can't reach device (ping %s)" % self.__address[0])
         if not self.force_udp and self.helper.test_tcp() == 0:
             self.user_packet_size = 72 # default zk8
-        self.__create_socket()
+        await self.__create_socket()
         self.__session_id = 0
         self.__reply_id = const.USHRT_MAX - 1
-        cmd_response = self.__send_command(const.CMD_CONNECT)
+        cmd_response = await self.__send_command(const.CMD_CONNECT)
         self.__session_id = self.__header[2]
         if cmd_response.get('code') == const.CMD_ACK_UNAUTH:
             if self.verbose: print ("try auth")
             command_string = make_commkey(self.__password, self.__session_id)
-            cmd_response = self.__send_command(const.CMD_AUTH, command_string)
+            cmd_response = await self.__send_command(const.CMD_AUTH, command_string)
         if cmd_response.get('status'):
             self.is_connect = True
             return self
@@ -386,66 +377,67 @@ class ZK(object):
             if self.verbose: print ("connect err response {} ".format(cmd_response["code"]))
             raise ZKErrorResponse("Invalid response: Can't connect")
 
-    def disconnect(self):
+    async def disconnect(self):
         """
         diconnect from the connected device
 
         :return: bool
         """
-        cmd_response = self.__send_command(const.CMD_EXIT)
+        cmd_response = await self.__send_command(const.CMD_EXIT)
         if cmd_response.get('status'):
             self.is_connect = False
-            if self.__sock:
-                self.__sock.close()
+            if self.__sock_writer:
+                self.__sock_writer.close()
+                await self.__sock_writer.wait_closed()
             return True
         else:
             raise ZKErrorResponse("can't disconnect")
 
-    def enable_device(self):
+    async def enable_device(self):
         """
         re-enable the connected device and allow user activity in device again
 
         :return: bool
         """
-        cmd_response = self.__send_command(const.CMD_ENABLEDEVICE)
+        cmd_response = await self.__send_command(const.CMD_ENABLEDEVICE)
         if cmd_response.get('status'):
             self.is_enabled = True
             return True
         else:
             raise ZKErrorResponse("Can't enable device")
 
-    def disable_device(self):
+    async def disable_device(self):
         """
         disable (lock) device, to ensure no user activity in device while some process run
 
         :return: bool
         """
-        cmd_response = self.__send_command(const.CMD_DISABLEDEVICE)
+        cmd_response = await self.__send_command(const.CMD_DISABLEDEVICE)
         if cmd_response.get('status'):
             self.is_enabled = False
             return True
         else:
             raise ZKErrorResponse("Can't disable device")
 
-    def get_firmware_version(self):
+    async def get_firmware_version(self):
         """
         :return: the firmware version
         """
-        cmd_response = self.__send_command(const.CMD_GET_VERSION,b'', 1024)
+        cmd_response = await self.__send_command(const.CMD_GET_VERSION,b'', 1024)
         if cmd_response.get('status'):
             firmware_version = self.__data.split(b'\x00')[0]
             return firmware_version.decode()
         else:
             raise ZKErrorResponse("Can't read frimware version")
 
-    def get_serialnumber(self):
+    async def get_serialnumber(self):
         """
         :return: the serial number
         """
         command = const.CMD_OPTIONS_RRQ
         command_string = b'~SerialNumber\x00'
         response_size = 1024
-        cmd_response = self.__send_command(command, command_string, response_size)
+        cmd_response = await self.__send_command(command, command_string, response_size)
         if cmd_response.get('status'):
             serialnumber = self.__data.split(b'=', 1)[-1].split(b'\x00')[0]
             serialnumber = serialnumber.replace(b'=', b'')
@@ -453,7 +445,7 @@ class ZK(object):
         else:
             raise ZKErrorResponse("Can't read serial number")
 
-    def get_platform(self):
+    async def get_platform(self):
         """
         :return: the platform name
         """
@@ -461,7 +453,7 @@ class ZK(object):
         command_string = b'~Platform\x00'
         response_size = 1024
 
-        cmd_response = self.__send_command(command, command_string, response_size)
+        cmd_response = await self.__send_command(command, command_string, response_size)
         if cmd_response.get('status'):
             platform = self.__data.split(b'=', 1)[-1].split(b'\x00')[0]
             platform = platform.replace(b'=', b'')
@@ -469,7 +461,7 @@ class ZK(object):
         else:
             raise ZKErrorResponse("Can't read platform name")
 
-    def get_mac(self):
+    async def get_mac(self):
         """
         :return: the machine's mac address
         """
@@ -477,14 +469,14 @@ class ZK(object):
         command_string = b'MAC\x00'
         response_size = 1024
 
-        cmd_response = self.__send_command(command, command_string, response_size)
+        cmd_response = await self.__send_command(command, command_string, response_size)
         if cmd_response.get('status'):
             mac = self.__data.split(b'=', 1)[-1].split(b'\x00')[0]
             return mac.decode()
         else:
             raise ZKErrorResponse("can't read mac address")
 
-    def get_device_name(self):
+    async def get_device_name(self):
         """
         return the device name
 
@@ -494,14 +486,14 @@ class ZK(object):
         command_string = b'~DeviceName\x00'
         response_size = 1024
 
-        cmd_response = self.__send_command(command, command_string, response_size)
+        cmd_response = await self.__send_command(command, command_string, response_size)
         if cmd_response.get('status'):
             device = self.__data.split(b'=', 1)[-1].split(b'\x00')[0]
             return device.decode()
         else:
             return ""
 
-    def get_face_version(self):
+    async def get_face_version(self):
         """
         :return: the face version
         """
@@ -509,14 +501,14 @@ class ZK(object):
         command_string = b'ZKFaceVersion\x00'
         response_size = 1024
 
-        cmd_response = self.__send_command(command, command_string, response_size)
+        cmd_response = await self.__send_command(command, command_string, response_size)
         if cmd_response.get('status'):
             response = self.__data.split(b'=', 1)[-1].split(b'\x00')[0]
             return safe_cast(response, int, 0)  if response else 0
         else:
             return None
 
-    def get_fp_version(self):
+    async def get_fp_version(self):
         """
         :return: the fingerprint version
         """
@@ -524,7 +516,7 @@ class ZK(object):
         command_string = b'~ZKFPVersion\x00'
         response_size = 1024
 
-        cmd_response = self.__send_command(command, command_string, response_size)
+        cmd_response = await self.__send_command(command, command_string, response_size)
         if cmd_response.get('status'):
             response = self.__data.split(b'=', 1)[-1].split(b'\x00')[0]
             response = response.replace(b'=', b'')
@@ -532,16 +524,16 @@ class ZK(object):
         else:
             raise ZKErrorResponse("can't read fingerprint version")
 
-    def _clear_error(self, command_string=b''):
+    async def _clear_error(self, command_string=b''):
         """
         clear ACK_error
         """
-        cmd_response = self.__send_command(const.CMD_ACK_ERROR, command_string, 1024)
-        cmd_response = self.__send_command(const.CMD_ACK_UNKNOWN, command_string, 1024)
-        cmd_response = self.__send_command(const.CMD_ACK_UNKNOWN, command_string, 1024)
-        cmd_response = self.__send_command(const.CMD_ACK_UNKNOWN, command_string, 1024)
+        cmd_response = await self.__send_command(const.CMD_ACK_ERROR, command_string, 1024)
+        cmd_response = await self.__send_command(const.CMD_ACK_UNKNOWN, command_string, 1024)
+        cmd_response = await self.__send_command(const.CMD_ACK_UNKNOWN, command_string, 1024)
+        cmd_response = await self.__send_command(const.CMD_ACK_UNKNOWN, command_string, 1024)
 
-    def get_extend_fmt(self):
+    async def get_extend_fmt(self):
         """
         determine extend fmt
         """
@@ -549,7 +541,7 @@ class ZK(object):
         command_string = b'~ExtendFmt\x00'
         response_size = 1024
 
-        cmd_response = self.__send_command(command, command_string, response_size)
+        cmd_response = await self.__send_command(command, command_string, response_size)
         if cmd_response.get('status'):
             fmt = (self.__data.split(b'=', 1)[-1].split(b'\x00')[0])
             return safe_cast(fmt, int, 0) if fmt else 0
@@ -557,7 +549,7 @@ class ZK(object):
             self._clear_error(command_string)
             return None
 
-    def get_user_extend_fmt(self):
+    async def get_user_extend_fmt(self):
         """
         determine user extend fmt
         """
@@ -565,7 +557,7 @@ class ZK(object):
         command_string = b'~UserExtFmt\x00'
         response_size = 1024
 
-        cmd_response = self.__send_command(command, command_string, response_size)
+        cmd_response = await self.__send_command(command, command_string, response_size)
         if cmd_response.get('status'):
             fmt = (self.__data.split(b'=', 1)[-1].split(b'\x00')[0])
             return safe_cast(fmt, int, 0) if fmt else 0
@@ -573,7 +565,7 @@ class ZK(object):
             self._clear_error(command_string)
             return None
 
-    def get_face_fun_on(self):
+    async def get_face_fun_on(self):
         """
         determine extend fmt
         """
@@ -581,7 +573,7 @@ class ZK(object):
         command_string = b'FaceFunOn\x00'
         response_size = 1024
 
-        cmd_response = self.__send_command(command, command_string, response_size)
+        cmd_response = await self.__send_command(command, command_string, response_size)
         if cmd_response.get('status'):
             response = (self.__data.split(b'=', 1)[-1].split(b'\x00')[0])
             return safe_cast(response, int ,0) if response else 0
@@ -589,7 +581,7 @@ class ZK(object):
             self._clear_error(command_string)
             return None
 
-    def get_compat_old_firmware(self):
+    async def get_compat_old_firmware(self):
         """
         determine old firmware
         """
@@ -597,7 +589,7 @@ class ZK(object):
         command_string = b'CompatOldFirmware\x00'
         response_size = 1024
 
-        cmd_response = self.__send_command(command, command_string, response_size)
+        cmd_response = await self.__send_command(command, command_string, response_size)
         if cmd_response.get('status'):
             response = (self.__data.split(b'=', 1)[-1].split(b'\x00')[0])
             return safe_cast(response, int, 0) if response else 0
@@ -605,58 +597,58 @@ class ZK(object):
             self._clear_error(command_string)
             return None
 
-    def get_network_params(self):
+    async def get_network_params(self):
         """
         get network params
         """
         ip = self.__address[0]
         mask = b''
         gate = b''
-        cmd_response = self.__send_command(const.CMD_OPTIONS_RRQ, b'IPAddress\x00', 1024)
+        cmd_response = await self.__send_command(const.CMD_OPTIONS_RRQ, b'IPAddress\x00', 1024)
         if cmd_response.get('status'):
             ip = (self.__data.split(b'=', 1)[-1].split(b'\x00')[0])
-        cmd_response = self.__send_command(const.CMD_OPTIONS_RRQ, b'NetMask\x00', 1024)
+        cmd_response = await self.__send_command(const.CMD_OPTIONS_RRQ, b'NetMask\x00', 1024)
         if cmd_response.get('status'):
             mask = (self.__data.split(b'=', 1)[-1].split(b'\x00')[0])
-        cmd_response = self.__send_command(const.CMD_OPTIONS_RRQ, b'GATEIPAddress\x00', 1024)
+        cmd_response = await self.__send_command(const.CMD_OPTIONS_RRQ, b'GATEIPAddress\x00', 1024)
         if cmd_response.get('status'):
             gate = (self.__data.split(b'=', 1)[-1].split(b'\x00')[0])
         return {'ip': ip.decode(), 'mask': mask.decode(), 'gateway': gate.decode()}
 
-    def get_pin_width(self):
+    async def get_pin_width(self):
         """
         :return: the PIN width
         """
         command = const.CMD_GET_PINWIDTH
         command_string = b' P'
         response_size = 9
-        cmd_response = self.__send_command(command, command_string, response_size)
+        cmd_response = await self.__send_command(command, command_string, response_size)
         if cmd_response.get('status'):
             width = self.__data.split(b'\x00')[0]
             return bytearray(width)[0]
         else:
             raise ZKErrorResponse("can0t get pin width")
 
-    def free_data(self):
+    async def free_data(self):
         """
         clear buffer
 
         :return: bool
         """
         command = const.CMD_FREE_DATA
-        cmd_response = self.__send_command(command)
+        cmd_response = await self.__send_command(command)
         if cmd_response.get('status'):
             return True
         else:
             raise ZKErrorResponse("can't free data")
 
-    def read_sizes(self):
+    async def read_sizes(self):
         """
         read the memory ussage
         """
         command = const.CMD_GET_FREE_SIZES
         response_size = 1024
-        cmd_response = self.__send_command(command,b'', response_size)
+        cmd_response = await self.__send_command(command,b'', response_size)
         if cmd_response.get('status'):
             if self.verbose: print(codecs.encode(self.__data,'hex'))
             size = len(self.__data)
@@ -682,7 +674,7 @@ class ZK(object):
         else:
             raise ZKErrorResponse("can't read sizes")
 
-    def unlock(self, time=3):
+    async def unlock(self, time=3):
         """
         unlock the door\n
         thanks to https://github.com/SoftwareHouseMerida/pyzk/
@@ -692,7 +684,7 @@ class ZK(object):
         """
         command = const.CMD_UNLOCK
         command_string = pack("I",int(time)*10)
-        cmd_response = self.__send_command(command, command_string)
+        cmd_response = await self.__send_command(command, command_string)
         if cmd_response.get('status'):
             return True
         else:
@@ -710,14 +702,14 @@ class ZK(object):
             self.faces, self.faces_cap
         )
 
-    def restart(self):
+    async def restart(self):
         """
         restart the device
 
         :return: bool
         """
         command = const.CMD_RESTART
-        cmd_response = self.__send_command(command)
+        cmd_response = await self.__send_command(command)
         if cmd_response.get('status'):
             self.is_connect = False
             self.next_uid = 1
@@ -725,19 +717,19 @@ class ZK(object):
         else:
             raise ZKErrorResponse("can't restart device")
 
-    def get_time(self):
+    async def get_time(self):
         """
         :return: the machine's time
         """
         command = const.CMD_GET_TIME
         response_size = 1032
-        cmd_response = self.__send_command(command, b'', response_size)
+        cmd_response = await self.__send_command(command, b'', response_size)
         if cmd_response.get('status'):
             return self.__decode_time(self.__data[:4])
         else:
             raise ZKErrorResponse("can't get time")
 
-    def set_time(self, timestamp):
+    async def set_time(self, timestamp):
         """
         set Device time (pass datetime object)
 
@@ -745,20 +737,20 @@ class ZK(object):
         """
         command = const.CMD_SET_TIME
         command_string = pack(b'I', self.__encode_time(timestamp))
-        cmd_response = self.__send_command(command, command_string)
+        cmd_response = await self.__send_command(command, command_string)
         if cmd_response.get('status'):
             return True
         else:
             raise ZKErrorResponse("can't set time")
 
-    def poweroff(self):
+    async def poweroff(self):
         """
         shutdown the machine
         """
         command = const.CMD_POWEROFF
         command_string = b''
         response_size = 1032
-        cmd_response = self.__send_command(command, command_string, response_size)
+        cmd_response = await self.__send_command(command, command_string, response_size)
         if cmd_response.get('status'):
             self.is_connect = False
             self.next_uid = 1
@@ -766,15 +758,15 @@ class ZK(object):
         else:
             raise ZKErrorResponse("can't poweroff")
 
-    def refresh_data(self):
+    async def refresh_data(self):
         command = const.CMD_REFRESHDATA
-        cmd_response = self.__send_command(command)
+        cmd_response = await self.__send_command(command)
         if cmd_response.get('status'):
             return True
         else:
             raise ZKErrorResponse("can't refresh data")
 
-    def test_voice(self, index=0):
+    async def test_voice(self, index=0):
         """
         play test voice:\n
          0 Thank You\n
@@ -839,13 +831,13 @@ class ZK(object):
         """
         command = const.CMD_TESTVOICE
         command_string = pack("I", index)
-        cmd_response = self.__send_command(command, command_string)
+        cmd_response = await self.__send_command(command, command_string)
         if cmd_response.get('status'):
             return True
         else:
             return False
 
-    def set_user(self, uid=None, name='', privilege=0, password='', group_id='', user_id='', card=0):
+    async def set_user(self, uid=None, name='', privilege=0, password='', group_id='', user_id='', card=0):
         """
         create or update user by uid
 
@@ -882,17 +874,17 @@ class ZK(object):
             card_str = pack('<I', int(card))[:4]
             command_string = pack('HB8s24s4sx7sx24s', uid, privilege, password.encode(self.encoding, errors='ignore'), name_pad, card_str, group_id.encode(), user_id.encode())
         response_size = 1024 #TODO check response?
-        cmd_response = self.__send_command(command, command_string, response_size)
+        cmd_response = await self.__send_command(command, command_string, response_size)
         if self.verbose: print("Response: %s" % cmd_response)
         if not cmd_response.get('status'):
             raise ZKErrorResponse("Can't set user")
-        self.refresh_data()
+        await self.refresh_data()
         if self.next_uid == uid:
             self.next_uid += 1 # better recalculate again
         if self.next_user_id == user_id:
             self.next_user_id = str(self.next_uid)
 
-    def save_user_template(self, user, fingers=[]):
+    async def save_user_template(self, user, fingers=[]):
         """
         save user and template
 
@@ -900,7 +892,7 @@ class ZK(object):
         :param fingers: list of finger. (The maximum index 0-9)
         """
         if not isinstance(user, User):
-            users = self.get_users()
+            users = await self.get_users()
             tusers = list(filter(lambda x: x.uid==user, users))
             if len(tusers) == 1:
                 user = tusers[0]
@@ -930,18 +922,18 @@ class ZK(object):
         self._send_with_buffer(packet)
         command = 110
         command_string = pack('<IHH', 12,0,8)
-        cmd_response = self.__send_command(command, command_string)
+        cmd_response = await self.__send_command(command, command_string)
         if not cmd_response.get('status'):
             raise ZKErrorResponse("Can't save utemp")
-        self.refresh_data()
+        await self.refresh_data()
 
-    def _send_with_buffer(self, buffer):
+    async def _send_with_buffer(self, buffer):
         MAX_CHUNK = 1024
         size = len(buffer)
         self.free_data()
         command = const.CMD_PREPARE_DATA
         command_string = pack('I', size)
-        cmd_response = self.__send_command(command, command_string)
+        cmd_response = await self.__send_command(command, command_string)
         if not cmd_response.get('status'):
             raise ZKErrorResponse("Can't prepare data")
         remain = size % MAX_CHUNK
@@ -953,15 +945,15 @@ class ZK(object):
         if remain:
             self.__send_chunk(buffer[start:start+remain])
 
-    def __send_chunk(self, command_string):
+    async def __send_chunk(self, command_string):
         command = const.CMD_DATA
-        cmd_response = self.__send_command(command, command_string)
+        cmd_response = await self.__send_command(command, command_string)
         if cmd_response.get('status'):
             return True
         else:
             raise ZKErrorResponse("Can't send chunk")
 
-    def delete_user_template(self, uid=0, temp_id=0, user_id=''):
+    async def delete_user_template(self, uid=0, temp_id=0, user_id=''):
         """
         Delete specific template
 
@@ -972,26 +964,26 @@ class ZK(object):
         if self.tcp and user_id:
             command = 134
             command_string = pack('<24sB', str(user_id), temp_id)
-            cmd_response = self.__send_command(command, command_string)
+            cmd_response = await self.__send_command(command, command_string)
             if cmd_response.get('status'):
                 return True
             else:
                 return False # probably empty!
         if not uid:
-            users = self.get_users()
+            users = await self.get_users()
             users = list(filter(lambda x: x.user_id==str(user_id), users))
             if not users:
                 return False
             uid = users[0].uid
         command = const.CMD_DELETE_USERTEMP
         command_string = pack('hb', uid, temp_id)
-        cmd_response = self.__send_command(command, command_string)
+        cmd_response = await self.__send_command(command, command_string)
         if cmd_response.get('status'):
             return True #refres_data (1013)?
         else:
             return False # probably empty!
 
-    def delete_user(self, uid=0, user_id=''):
+    async def delete_user(self, uid=0, user_id=''):
         """
         delete specific user by uid or user_id
 
@@ -1000,28 +992,28 @@ class ZK(object):
         :return: bool
         """
         if not uid:
-            users = self.get_users()
+            users = await self.get_users()
             users = list(filter(lambda x: x.user_id==str(user_id), users))
             if not users:
                 return False
             uid = users[0].uid
         command = const.CMD_DELETE_USER
         command_string = pack('h', uid)
-        cmd_response = self.__send_command(command, command_string)
+        cmd_response = await self.__send_command(command, command_string)
         if not cmd_response.get('status'):
             raise ZKErrorResponse("Can't delete user")
-        self.refresh_data()
+        await self.refresh_data()
         if uid == (self.next_uid - 1):
             self.next_uid = uid
 
-    def get_user_template(self, uid, temp_id=0, user_id=''):
+    async def get_user_template(self, uid, temp_id=0, user_id=''):
         """
         :param uid: user ID that are generated from device
         :param user_id: your own user ID
         :return: list Finger object of the selected user
         """
         if not uid:
-            users = self.get_users()
+            users = await self.get_users()
             users = list(filter(lambda x: x.user_id==str(user_id), users))
             if not users:
                 return False
@@ -1030,7 +1022,7 @@ class ZK(object):
             command = 88 # command secret!!! GET_USER_TEMPLATE
             command_string = pack('hb', uid, temp_id)
             response_size = 1024 + 8
-            cmd_response = self.__send_command(command, command_string, response_size)
+            cmd_response = await self.__send_command(command, command_string, response_size)
             data = self.__recieve_chunk()
             if data is not None:
                 resp = data[:-1]
@@ -1067,18 +1059,18 @@ class ZK(object):
             total_size -= size
         return templates
 
-    def get_users(self):
+    async def get_users(self):
         """
         :return: list of User object
         """
-        self.read_sizes()
+        await self.read_sizes()
         if self.users == 0:
             self.next_uid = 1
             self.next_user_id='1'
             return []
         users = []
         max_uid = 0
-        userdata, size = self.read_with_buffer(const.CMD_USERTEMP_RRQ, const.FCT_USER)
+        userdata, size = await self.read_with_buffer(const.CMD_USERTEMP_RRQ, const.FCT_USER)
         if self.verbose: print("user size {} (= {})".format(size, len(userdata)))
         if size <= 4:
             print("WRN: missing user data")
@@ -1127,43 +1119,43 @@ class ZK(object):
                 break
         return users
 
-    def cancel_capture(self):
+    async def cancel_capture(self):
         """
         cancel capturing finger
 
         :return: bool
         """
         command = const.CMD_CANCELCAPTURE
-        cmd_response = self.__send_command(command)
+        cmd_response = await self.__send_command(command)
         return bool(cmd_response.get('status'))
 
-    def verify_user(self):
+    async def verify_user(self):
         """
         start verify finger mode (after capture)
 
         :return: bool
         """
         command = const.CMD_STARTVERIFY
-        cmd_response = self.__send_command(command)
+        cmd_response = await self.__send_command(command)
         if cmd_response.get('status'):
             return True
         else:
             raise ZKErrorResponse("Cant Verify")
 
-    def reg_event(self, flags):
+    async def reg_event(self, flags):
         """
         reg events
         """
         command = const.CMD_REG_EVENT
         command_string = pack ("I", flags)
-        cmd_response = self.__send_command(command, command_string)
+        cmd_response = await self.__send_command(command, command_string)
         if not cmd_response.get('status'):
             raise ZKErrorResponse("cant' reg events %i" % flags)
 
-    def set_sdk_build_1(self):
+    async def set_sdk_build_1(self):
         command = const.CMD_OPTIONS_WRQ
         command_string = b"SDKBuild=1"
-        cmd_response = self.__send_command(command, command_string)
+        cmd_response = await self.__send_command(command, command_string)
         if not cmd_response.get('status'):
             return False
         return True
@@ -1180,7 +1172,7 @@ class ZK(object):
         command = const.CMD_STARTENROLL
         done = False
         if  not user_id:
-            users = self.get_users()
+            users = await self.get_users()
             users = list(filter(lambda x: x.uid==uid, users))
             if len(users) >= 1:
                 user_id = users[0].user_id
@@ -1191,10 +1183,9 @@ class ZK(object):
         else:
             command_string = pack('<Ib', int(user_id), temp_id)
         self.cancel_capture()
-        cmd_response = self.__send_command(command, command_string)
+        cmd_response = await self.__send_command(command, command_string)
         if not cmd_response.get('status'):
             raise ZKErrorResponse("Cant Enroll user #%i [%i]" %(uid, temp_id))
-        self.__sock.settimeout(60)
         attempts = 0
         done = False
 
@@ -1202,8 +1193,8 @@ class ZK(object):
             if attempts==3:
                 attempts = 0
             if self.verbose: print(f"Attempt #{attempts} at finger input")
-            data_recv = await self.nb_sock_recv(60)
-            self.__ack_ok()
+            data_recv = await self.__sock_reader.read(1032)
+            await self.__ack_ok()
             data_recv = codecs.encode(data_recv,'hex')
             if self.verbose: print(data_recv)
             print(data_recv[24:28], data_recv[24:28] == b'0800')
@@ -1219,164 +1210,52 @@ class ZK(object):
         # data_recv = await self.nb_sock_recv(60)
         # self.__ack_ok()
         if self.verbose: print(codecs.encode(data_recv,'hex'))
-        self.__sock.settimeout(self.__timeout)
         # self.reg_event(0) # TODO: test
-        self.cancel_capture()
-        self.verify_user()
+        await self.cancel_capture()
+        await self.verify_user()
         return done
-        # attempts = 3
-        # while attempts:
-        #     if self.verbose: print("A:%i esperando primer regevent" % attempts)
-        #     data_recv = await self.nb_sock_recv(60)
-        #     self.__ack_ok()
-        #     if self.verbose: print(codecs.encode(data_recv,'hex'))
-        #     if self.tcp:
-        #         if len(data_recv) > 16:
-        #             res = unpack("H", data_recv.ljust(24,b"\x00")[16:18])[0]
-        #             if self.verbose: print("res %i" % res)
-        #             if res == 0 or res == 6 or res == 4:
-        #                 if self.verbose: print ("posible timeout  o reg Fallido")
-        #                 break
-        #     else:
-        #         if len(data_recv) > 8:
-        #             res = unpack("H", data_recv.ljust(16,b"\x00")[8:10])[0]
-        #             if self.verbose: print("res %i" % res)
-        #             if res == 6 or res == 4:
-        #                 if self.verbose: print ("posible timeout")
-        #                 break
-        #     if self.verbose: print ("A:%i esperando 2do regevent" % attempts)
-        #     data_recv = await self.nb_sock_recv(60)
-        #     self.__ack_ok()
-        #     if self.verbose: print (codecs.encode(data_recv, 'hex'))
-        #     if self.tcp:
-        #         if len(data_recv) > 8:
-        #             res = unpack("H", data_recv.ljust(24,b"\x00")[16:18])[0]
-        #             if self.verbose: print("res 2 %i" % res)
-        #             if res == 6 or res == 4:
-        #                 if self.verbose: print ("posible timeout  o reg Fallido")
-        #                 break
-        #             elif res >= 0x64:
-        #                 if self.verbose: print ("ok, continue?")
-        #                 attempts -= 1
-        #     else:
-        #         if len(data_recv) > 8:
-        #             res = unpack("H", data_recv.ljust(16,b"\x00")[8:10])[0]
-        #             if self.verbose: print("res %i" % res)
-        #             if res == 6 or res == 4:
-        #                 if self.verbose: print ("posible timeout  o reg Fallido")
-        #                 break
-        #             elif res == 0x64:
-        #                 if self.verbose: print ("ok, continue?")
-        #                 attempts -= 1
-        # if attempts == 0:
-        #     data_recv = self.__sock.recv(1032)
-        #     self.__ack_ok()
-        #     if self.verbose: print (codecs.encode(data_recv, 'hex'))
-        #     if self.tcp:
-        #         res = unpack("H", data_recv.ljust(24,b"\x00")[16:18])[0]
-        #     else:
-        #         res = unpack("H", data_recv.ljust(16,b"\x00")[8:10])[0]
-        #     if self.verbose: print("res %i" % res)
-        #     if res == 5:
-        #         if self.verbose: print ("finger duplicate")
-        #     if res == 6 or res == 4:
-        #         if self.verbose: print ("posible timeout")
-        #     if res  == 0:
-        #         size = unpack("H", data_recv.ljust(16,b"\x00")[10:12])[0]
-        #         pos = unpack("H", data_recv.ljust(16,b"\x00")[12:14])[0]
-        #         if self.verbose: print("enroll ok", size, pos)
-        #         done = True
-        # self.__sock.settimeout(self.__timeout)
-        # self.reg_event(0) # TODO: test
-        # self.cancel_capture()
-        # self.verify_user()
-        # return done
 
-    async def nb_sock_recv(self, time_out:float):
-        
-        import time
-        s = time.perf_counter()
-        self.__sock.setblocking(False)
-        try:
-            while time.perf_counter() - s < time_out:
-                try:
-                    data_recv = self.__sock.recv(1032)
-                    if len(data_recv) > 0:
-                        return data_recv
-                except BlockingIOError:
-                    pass
-                finally:
-                    await asyncio.sleep(0)
-            raise timeout
-        finally:
-            self.__sock.setblocking(True)
-
-    async def lc_sock_recv(self, time_out:float):
-        '''Socket reciever for live capture'''        
-        import time
-        loop = asyncio.get_event_loop()
-        end_time = loop.time() + time_out
-        self.__sock.setblocking(False)
-        try:
-            while (loop.time() < end_time) and not self.end_live_capture:
-                try:
-                    data_recv = self.__sock.recv(1032)
-                    if len(data_recv) > 0:
-                        return data_recv
-                except BlockingIOError:
-                    pass
-                finally:
-                    await asyncio.sleep(0)
-            if self.end_live_capture:
-                raise InterruptedError
-            else:
-                raise timeout
-        finally:
-            self.__sock.setblocking(True)
 
     async def close_live_capture(self):
-        if not self.end_live_capture:
-            print("Im here!")
-            self.end_live_capture = True
-            self.__live_event.clear()
-            await self.__live_event.wait()
+        # if not self.end_live_capture:
+        print("Im here!")
+        self.end_live_capture = True
+        self.__live_event.set()
+        self.__live_event_closed.clear()
+        await self.__live_event_closed.wait()
             
-    async def live_capture(self, new_timeout=10):
+    async def live_capture(self):
         """
         try live capture of events
         """
         was_enabled = self.is_enabled
-        users = self.get_users()
-        self.cancel_capture()
-        self.verify_user()
+        users = await self.get_users()
+        await self.cancel_capture()
+        await self.verify_user()
         if not self.is_enabled:
-            self.enable_device()
+            await self.enable_device()
         if self.verbose: print ("start live_capture")
-        self.reg_event(const.EF_ATTLOG)
-        self.__sock.settimeout(new_timeout)
-        self.__sock.setblocking(False)
+        await self.reg_event(const.EF_ATTLOG)
         self.end_live_capture = False
+        cancellation_task = asyncio.create_task(self.__live_event.wait())
         while True:
             try:
-                # if self.verbose: print ("esperando event")
-                # if not self.__live_queue.empty():
-                #     await self.__live_queue.get()
-                #     break
-                # start = time.perf_counter()
-                # while time.perf_counter() - start < new_timeout:
-                 
-                # data_recv = await self.nb_sock_recv(new_timeout)
-                data_recv = await self.lc_sock_recv(new_timeout)
-
-                self.__ack_ok()
-                if self.tcp:
-                    size = unpack('<HHI', data_recv[:8])[2]
-                    header = unpack('HHHH', data_recv[8:16])
-                    data = data_recv[16:]
-                else:
-                    size = len(data_recv)
-                    header = unpack('<4H', data_recv[:8])
-                    data = data_recv[8:]
+                reader_task = asyncio.create_task(self.__sock_reader.read(1032))
+                done, _ = await asyncio.wait({reader_task, cancellation_task}, return_when=asyncio.FIRST_COMPLETED)
+                if cancellation_task in done:
+                    reader_task.cancel()
+                    try:
+                        await reader_task
+                    except CancelledError:
+                        pass
+                    finally:
+                        break
+                task = done.pop()
+                data_recv = task.result()
+                await self.__ack_ok()
+                size = unpack('<HHI', data_recv[:8])[2]
+                header = unpack('HHHH', data_recv[8:16])
+                data = data_recv[16:]
                 if not header[0] == const.CMD_REG_EVENT:
                     if self.verbose: print("not event! %x" % header[0])
                     continue
@@ -1407,24 +1286,17 @@ class ZK(object):
                     else:
                         uid = tuser[0].uid
                     yield Attendance(user_id, timestamp, status, punch, uid)
-            except timeout:
-                if self.verbose: print ("Live capture Timeout")
-                # yield None # return to keep watching
-                # continue
-            except InterruptedError:
-                break
             except (KeyboardInterrupt, SystemExit):
                 if self.verbose: print ("break")
                 break
-        self.__live_event.set()
+        self.__live_event_closed.set()
+        self.__live_event.clear()
         if self.verbose: print ("exit gracefully")
-        self.__sock.settimeout(self.__timeout)
-        self.__sock.setblocking(True)
-        self.reg_event(0)
+        await self.reg_event(0)
         if not was_enabled:
-            self.disable_device()
+            await self.disable_device()
 
-    def clear_data(self):
+    async def clear_data(self):
         """
         clear all data (included: user, attendance report, finger database)
 
@@ -1432,7 +1304,7 @@ class ZK(object):
         """
         command = const.CMD_CLEAR_DATA
         command_string = ''
-        cmd_response = self.__send_command(command, command_string)
+        cmd_response = await self.__send_command(command, command_string)
         if cmd_response.get('status'):
             self.next_uid = 1
             return True
@@ -1457,7 +1329,7 @@ class ZK(object):
             data.append(resp)
             size -= len(resp)
             if self.verbose: print ("new tcp DATA packet to fill misssing {}".format(size))
-            data_recv = bh + self.__sock.recv(size + 16 )
+            data_recv = bh + self.__sock_reader.read(size + 16 )
             if self.verbose: print ("new tcp DATA starting with {} bytes".format(len(data_recv)))
             resp, bh = self.__recieve_tcp_data(data_recv, size)
             data.append(resp)
@@ -1487,12 +1359,12 @@ class ZK(object):
                 data.append(data_recv)
             return b''.join(data), broken_header
 
-    def __recieve_raw_data(self, size):
+    async def __recieve_raw_data(self, size):
         """ partial data ? """
         data = []
         if self.verbose: print ("expecting {} bytes raw data".format(size))
         while size > 0:
-            data_recv = self.__sock.recv(size)
+            data_recv = await self.__sock_reader.read(size)
             recieved = len(data_recv)
             if self.verbose: print ("partial recv {}".format(recieved))
             if recieved < 100 and self.verbose: print ("   recv {}".format(codecs.encode(data_recv, 'hex')))
@@ -1501,7 +1373,7 @@ class ZK(object):
             if self.verbose: print ("still need {}".format(size))
         return b''.join(data)
 
-    def __recieve_chunk(self):
+    async def __recieve_chunk(self):
         """ recieve a chunk """
         if self.__response == const.CMD_DATA:
             if self.tcp:
@@ -1525,18 +1397,18 @@ class ZK(object):
                 if len(self.__data) >= (8 + size):
                     data_recv = self.__data[8:]
                 else:
-                    data_recv = self.__data[8:] + self.__sock.recv(size + 32)
+                    data_recv = self.__data[8:] + await self.__sock_reader.read(size + 32)
                 resp, broken_header = self.__recieve_tcp_data(data_recv, size)
                 data.append(resp)
                 # get CMD_ACK_OK
                 if len(broken_header) < 16:
-                    data_recv = broken_header + self.__sock.recv(16)
+                    data_recv = broken_header + await self.__sock_reader.read(16)
                 else:
                     data_recv = broken_header
                 if len(data_recv) < 16:
                     print ("trying to complete broken ACK %s /16" % len(data_recv))
                     if self.verbose: print (data_recv.encode('hex'))
-                    data_recv += self.__sock.recv(16 - len(data_recv)) #TODO: CHECK HERE_!
+                    data_recv += await self.__sock_reader.read(16 - len(data_recv)) #TODO: CHECK HERE_!
                 if not self.__test_tcp_top(data_recv):
                     if self.verbose: print ("invalid chunk tcp ACK OK")
                     return None
@@ -1550,7 +1422,7 @@ class ZK(object):
 
                 return resp
             while True:
-                data_recv = self.__sock.recv(1024+8)
+                data_recv = await self.__sock_reader.read(1024+8)
                 response = unpack('<4H', data_recv[:8])[0]
                 if self.verbose: print ("# packet response is: {}".format(response))
                 if response == const.CMD_DATA:
@@ -1567,7 +1439,7 @@ class ZK(object):
             if self.verbose: print ("invalid response %s" % self.__response)
             return None
 
-    def __read_chunk(self, start, size):
+    async def __read_chunk(self, start, size):
         """
         read a chunk from buffer
         """
@@ -1578,14 +1450,14 @@ class ZK(object):
                 response_size = size + 32
             else:
                 response_size = 1024 + 8
-            cmd_response = self.__send_command(command, command_string, response_size)
+            cmd_response = await self.__send_command(command, command_string, response_size)
             data = self.__recieve_chunk()
             if data is not None:
                 return data
         else:
             raise ZKErrorResponse("can't read chunk %i:[%i]" % (start, size))
 
-    def read_with_buffer(self, command, fct=0 ,ext=0):
+    async def read_with_buffer(self, command, fct=0 ,ext=0):
         """
         Test read info with buffered command (ZK6: 1503)
         """
@@ -1598,7 +1470,7 @@ class ZK(object):
         response_size = 1024
         data = []
         start = 0
-        cmd_response = self.__send_command(1503, command_string, response_size)
+        cmd_response = await self.__send_command(1503, command_string, response_size)
         if not cmd_response.get('status'):
             raise ZKErrorResponse("RWB Not supported")
         if cmd_response['code'] == const.CMD_DATA:
@@ -1631,7 +1503,7 @@ class ZK(object):
         if self.verbose: print ("_read w/chunk %i bytes" % start)
         return b''.join(data), start
 
-    def get_attendance(self):
+    async def get_attendance(self):
         """
         return attendance record
 
@@ -1640,7 +1512,7 @@ class ZK(object):
         self.read_sizes()
         if self.records == 0:
             return []
-        users = self.get_users()
+        users = await self.get_users()
         if self.verbose: print (users)
         attendances = []
         attendance_data, size = self.read_with_buffer(const.CMD_ATTLOG_RRQ)
@@ -1697,14 +1569,14 @@ class ZK(object):
                 attendance_data = attendance_data[40:]
         return attendances
 
-    def clear_attendance(self):
+    async def clear_attendance(self):
         """
         clear all attendance record
 
         :return: bool
         """
         command = const.CMD_CLEAR_ATTLOG
-        cmd_response = self.__send_command(command)
+        cmd_response = await self.__send_command(command)
         if cmd_response.get('status'):
             return True
         else:
