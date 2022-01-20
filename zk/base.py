@@ -1217,8 +1217,6 @@ class ZK(object):
 
 
     async def close_live_capture(self):
-        # if not self.end_live_capture:
-        print("Im here!")
         self.end_live_capture = True
         self.__live_event.set()
         self.__live_event_closed.clear()
