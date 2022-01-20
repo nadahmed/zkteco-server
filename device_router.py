@@ -52,13 +52,13 @@ class DeviceRouter:
         
 
 
-        class Device(pydantic.BaseModel):
+        class DeviceModel(pydantic.BaseModel):
             name: str
             ip: str
             description: str
 
         @self._router.post("", status_code=fastapi.status.HTTP_201_CREATED)
-        async def add_device(device: Device):
+        async def add_device(device: DeviceModel):
             id = len(self._devices) + 1
             d = {
                 "id": id,
@@ -68,8 +68,8 @@ class DeviceRouter:
                 "state": "active",
                 "connected": True
             }
-
-            self._devices.append(d)
+            dev = Device(**d)
+            self._devices.append(dev)
             return d
 
         class PingAddress(pydantic.BaseModel):
