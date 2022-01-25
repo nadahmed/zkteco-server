@@ -1,11 +1,10 @@
 import asyncio
-import fastapi
+import typing
+from uuid import UUID
 import zk
 
 class Device:
-
-
-    def __init__(self, id: int, name:str, ip:str, description:str, port=4370, *args, **kwargs, ) -> None:
+    def __init__(self, id: str, name:str, ip:str, description:str, port=4370, *args, **kwargs, ) -> None:
         self.id = id
         self.name = name
         self.description = description
@@ -14,13 +13,24 @@ class Device:
         self._connection = zk.ZK(self.ip, port=self.port, timeout=5, password=0, ommit_ping=False, verbose= True)
         self._live_capture_lock = asyncio.Lock()
         self._device_lock = asyncio.Lock()
-
+        self.live_events: typing.List[asyncio.Queue] = []
+        
     async def live_capture_loop(self):
         while True:
             async with self._live_capture_lock:
                 print("Starting Live Capture")                  
                 async for attendance in self._connection.live_capture():
                     print(F"User: {attendance.user_id}\nPunch: {attendance.punch}\nTime: {attendance.timestamp}\nStatus: {attendance.status}\n",)
+                    for q in self.live_events:
+                        data = {
+                            "punch": attendance.punch,
+                            "status": attendance.status,
+                            "timestamp":attendance.timestamp.isoformat(),
+                            "uid":attendance.uid,
+                            "user_id": attendance.user_id,
+                        }
+                        await q.put(data)
+
             print("Should release lock")
             # lock.release()
             # print("Released Locking for Live capture")

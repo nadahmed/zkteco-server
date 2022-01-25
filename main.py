@@ -1,16 +1,16 @@
-from asyncio import tasks
-from typing import Coroutine, List
+from typing import List
+from databases import Database
 import fastapi
-from device import Device
+from device.device import Device
 import asyncio
-from pydantic import BaseModel
-from zk.exception import ZKErrorConnection, ZKNetworkError
-from fastapi import status
 from fastapi.middleware.cors import CORSMiddleware
-from device_router import DeviceRouter
+from device.device_router import DeviceRouter
+from device.db_connection import database
+from device.models import DeviceModel
 
 
 app = fastapi.FastAPI()
+app.state.database = database
 
 origins = [
     "*",
@@ -24,42 +24,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-devices_conf = [
-    {"id": 1,
-        "name": "test1",
-    "ip": "192.168.50.166",
-    "description":"This is test device 1",
-    "state": "ready",
-    "connected": True},
-    {"id": 2,
-    "name": "test2",
-    "ip": "192.168.50.227",
-    "port":7332,
-    "description":"This is test device 2",
-    "state": "unknown",
-    "connected": False},
-    {"id": 3,
-    "name": "test3",
-    "ip": "192.168.52.166",
-    "description":"This is test device 3",
-    "state": "busy",
-    "connected": True},
-    # {"id": 4,
-    # "name": "test4",
-    # "ip": "192.168.53.166",
-    # "description":"This is test device 4",
-    # "state": "unknown",
-    # "connected": False},
-    ]
-
 devices: List[Device]= []
-for device in devices_conf:
-    d = Device(**device)
-    devices.append(d)
-    # devApp = d.getApp()
 
-    # app.mount("/devices/"+ str(d.id), devApp)
 dr = DeviceRouter(devices)
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    global dr
+    database_:Database = app.state.database
+    if not database_.is_connected:
+        await database_.connect()
+    for device in await DeviceModel.objects.all():
+        d = Device(**device.dict())
+        devices.append(d)
+    dr = DeviceRouter(devices)
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    database_:Database = app.state.database
+    if database_.is_connected:
+        await database_.disconnect()
+
 
 @app.middleware("http")
 async def timeout_middleware(request: fastapi.Request, call_next):

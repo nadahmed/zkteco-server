@@ -1,8 +1,12 @@
+from ipaddress import ip_address
+from sqlite3 import IntegrityError
 import typing
 import fastapi
 import pydantic
-from device import Device
+from device.device import Device
 import asyncio
+
+from device.models import DeviceModel
 
 import zk
 from zk.base import ZK_helper
@@ -22,7 +26,7 @@ class DeviceRouter:
         self._setupSubRouter()
         self._router.include_router(self._sub_router)
 
-    def _device_check(self, deviceId: int = fastapi.Path(...)):
+    def _device_check(self, deviceId: str = fastapi.Path(...)):
         try:
             device = [el for el in self._devices if el.id == deviceId][0]
         except IndexError:
@@ -36,41 +40,32 @@ class DeviceRouter:
     def getRouter(self):
         return self._router
 
-
     def _setupRouter(self):
-        @self._router.get("")
+        @self._router.get("", response_model=typing.List[DeviceModel])
         async def get_all_devices():
-            devices = []
-            for device in self._devices:
-                devices.append({
-                "id" :device.id,
-                "name" :device.name,
-                "ip": device.ip,
-                "port": device.port,
-                "description" :device.description})
-            return devices
+            return await DeviceModel.objects.all()
         
 
-
-        class DeviceModel(pydantic.BaseModel):
+        class DeviceCreateModel(pydantic.BaseModel):
             name: str
             ip: str
+            port : typing.Optional[int] = 4370
             description: str
-
-        @self._router.post("", status_code=fastapi.status.HTTP_201_CREATED)
-        async def add_device(device: DeviceModel):
-            id = len(self._devices) + 1
-            d = {
-                "id": id,
-                "name": device.name,
-                "ip": device.ip,
-                "description": device.description,
-                "state": "active",
-                "connected": True
-            }
-            dev = Device(**d)
-            self._devices.append(dev)
-            return d
+        
+        @self._router.post("", response_model=DeviceModel ,status_code=fastapi.status.HTTP_201_CREATED)
+        async def add_device(device: DeviceCreateModel):
+            """
+            TODO: Connect device on add
+            """
+            try:
+                device.ip = str(ip_address(device.ip))
+                d = await DeviceModel.objects.create(**device.dict())
+                self._devices.append(Device(**d.dict()))
+                return d
+            except IntegrityError as e:
+                raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, str(e))
+            except ValueError as e:
+                raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, str(e))
 
         class PingAddress(pydantic.BaseModel):
             ip: str
@@ -86,19 +81,44 @@ class DeviceRouter:
             
     def _setupSubRouter(self):
 
-        @self._sub_router.delete("")
-        async def remove_device(device: Device = fastapi.Depends(self._device_check)):            
-            self._devices.remove(device)
-            return fastapi.responses.JSONResponse({"id": device.id}, status_code=fastapi.status.HTTP_202_ACCEPTED)
+        class DeviceUpdateModel(pydantic.BaseModel):
+            name: typing.Optional[str]
+            description: typing.Optional[str]
 
-        @self._sub_router.get("/ping", summary="Ping device")
-        def index(device: Device = fastapi.Depends(self._device_check)):
-            helper = ZK_helper(device.ip, device.port)
-            if helper.test_ping():
-                return fastapi.Response("Pinging device was successful")
-            else:
-                raise fastapi.HTTPException(detail="Failed to ping device", status_code=fastapi.status.HTTP_408_REQUEST_TIMEOUT)
-            
+        @self._sub_router.put("", response_model=DeviceModel ,status_code=fastapi.status.HTTP_201_CREATED)
+        async def update_device(deviceModel: DeviceUpdateModel, device: Device = fastapi.Depends(self._device_check)):
+            try:
+                d = await DeviceModel.objects.get_or_none(id=device.id)
+                if d is not None:
+                    d.name = deviceModel.name if deviceModel.name else d.name
+                    d.description = deviceModel.description if deviceModel.description else d.description
+                    return await d.update()
+                raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, "Device does not exist.")
+            except IntegrityError as e:
+                raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, str(e))
+
+        @self._sub_router.delete("")
+        async def remove_device(device: Device = fastapi.Depends(self._device_check)):
+            """
+            TODO: Disconnect device and remove from array         
+            """            
+
+            await DeviceModel.objects.delete(id=device.id)
+            self._devices.remove(device)
+            return fastapi.responses.JSONResponse({"id": str(device.id)}, status_code=fastapi.status.HTTP_202_ACCEPTED)
+        
+        @self._sub_router.get("/stream")
+        async def live_capture(device: Device = fastapi.Depends(self._device_check)):
+            import json
+            async def get_value():
+                q = asyncio.Queue(1)                
+                try:
+                    device.live_events.append(q)
+                    while True:
+                        yield json.dumps(await q.get()) + "\n"
+                finally:
+                    device.live_events.remove(q)
+            return fastapi.responses.StreamingResponse(get_value(), media_type='application/json')
 
         @self._sub_router.get("/voice/{voiceId}", summary="Voice")
         async def test_voice(voiceId:int, device: Device = fastapi.Depends(self._device_check)):        
