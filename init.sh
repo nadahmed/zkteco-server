@@ -1,5 +1,4 @@
-if [ ! -f /code/test.db ]
-then
+if [[ ! -e /code/test.db ]]; then
     echo "File does not exist in Bash"
     echo "Running database migrations..."
     alembic upgrade head

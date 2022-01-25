@@ -7,7 +7,7 @@ services:
       volumes:
         - "db:/code"      
       network_mode: bridge
-      entrypoint: ['/bin/sh', /code/init.sh]
+      command: ['/bin/sh', /code/init.sh]
 
 volumes:
   db:
