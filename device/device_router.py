@@ -60,7 +60,9 @@ class DeviceRouter:
             try:
                 device.ip = str(ip_address(device.ip))
                 d = await DeviceModel.objects.create(**device.dict())
-                self._devices.append(Device(**d.dict()))
+                current_device = Device(**d.dict())
+                current_device.connected_task(True)
+                self._devices.append(current_device)
                 return d
             except IntegrityError as e:
                 raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, str(e))
@@ -74,18 +76,27 @@ class DeviceRouter:
         @self._router.post("/ping", status_code=fastapi.status.HTTP_201_CREATED, summary="Ping any device")
         async def ping_device(address:PingAddress):
             helper = ZK_helper(address.ip, address.port)
-            if helper.test_ping():
+            if await helper.test_ping():
                 return fastapi.Response("Pinging device was successful")
             else:
                 raise fastapi.HTTPException(detail="Failed to ping device", status_code=fastapi.status.HTTP_408_REQUEST_TIMEOUT)
-            
+
+    def any_one(self,cls, v):
+        print("Im validating")
+        if not any(v.values()):
+            raise ValueError('one of name or description must have a value')
+        return v
+
     def _setupSubRouter(self):
 
         class DeviceUpdateModel(pydantic.BaseModel):
-            name: typing.Optional[str]
-            description: typing.Optional[str]
+            name: typing.Optional[str] = None
+            description: typing.Optional[str] = None
 
-        @self._sub_router.put("", response_model=DeviceModel ,status_code=fastapi.status.HTTP_201_CREATED)
+            any_one = pydantic.root_validator(allow_reuse=True)(self.any_one)
+
+
+        @self._sub_router.put("", response_model=DeviceModel ,status_code=fastapi.status.HTTP_202_ACCEPTED)
         async def update_device(deviceModel: DeviceUpdateModel, device: Device = fastapi.Depends(self._device_check)):
             try:
                 d = await DeviceModel.objects.get_or_none(id=device.id)
@@ -105,6 +116,7 @@ class DeviceRouter:
 
             await DeviceModel.objects.delete(id=device.id)
             self._devices.remove(device)
+            device.cancel_connected_task()
             return fastapi.responses.JSONResponse({"id": str(device.id)}, status_code=fastapi.status.HTTP_202_ACCEPTED)
         
         @self._sub_router.get("/stream")
@@ -267,15 +279,8 @@ class DeviceRouter:
         
         @self._sub_router.on_event("startup")
         async def bg_task():
-            loop = asyncio.get_event_loop()
-            
             for device in self._devices:
-                try:
-                    await device.connect()
-                    loop.create_task(device.live_capture_loop())
-                except zk.base.ZKNetworkError:
-                    pass
-
+                device.connected_task(True)
 
         @self._sub_router.on_event("shutdown")
         async def clean_up():

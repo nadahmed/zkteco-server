@@ -1,6 +1,8 @@
 import asyncio
 import typing
 from uuid import UUID
+
+from aiosqlite import connect
 import zk
 
 class Device:
@@ -14,7 +16,9 @@ class Device:
         self._live_capture_lock = asyncio.Lock()
         self._device_lock = asyncio.Lock()
         self.live_events: typing.List[asyncio.Queue] = []
-        
+        self.live_capture_task = None
+        self.connection_task = None
+
     async def live_capture_loop(self):
         while True:
             async with self._live_capture_lock:
@@ -36,10 +40,38 @@ class Device:
             # print("Released Locking for Live capture")
             print("Live capture ended")   
 
-    async def connect(self):
+    def live_capture_start_task(self):
+        if self.live_capture_task == None or self.live_capture_task.cancelled():
+            self.live_capture_task = asyncio.create_task(self.live_capture_loop())
+        return self.live_capture_task
+
+    def live_capture_cancel_task(self):
+        if self.live_capture_task != None and not self.live_capture_task.cancelled():
+            self.live_capture_task.cancel()
+
+    def connected_task(self, live_capture=False):
+        if self.connection_task==None or self.connection_task.cancelled():
+            self.connection_task = asyncio.create_task(self.keep_connecting(live_capture))
+    
+    def cancel_connected_task(self):
+        self.live_capture_cancel_task()
+        if self.connection_task!=None and not self.connection_task.cancelled():
+            self.connection_task.cancel()
+
+    async def keep_connecting(self, live_capture = False):
+        while True:
+            try:
+                await self.connect(live_capture)
+                break
+            except zk.base.ZKNetworkError:
+                await asyncio.sleep(5)
+
+    async def connect(self, live_capture=False):
         try:
             await self._connection.connect()
             await self._connection.enable_device()
+            if live_capture:
+                self.live_capture_start_task()
         except zk.base.ZKNetworkError as e:
             print(e)
             print("Trying to connect again in 5 sec")

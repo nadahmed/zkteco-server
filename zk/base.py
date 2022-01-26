@@ -73,22 +73,24 @@ class ZK_helper(object):
         self.ip = ip
         self.port = port
 
-    def test_ping(self):
+    async def test_ping(self):
         """
         Returns True if host responds to a ping request
 
         :return: bool
         """
-        import subprocess, platform
+        import platform
         # Ping parameters as function of OS
         ping_str = "-n 1" if  platform.system().lower()=="windows" else "-c 1 -W 5"
         args = "ping " + " " + ping_str + " " + self.ip
         need_sh = False if  platform.system().lower()=="windows" else True
         # Ping
-        return subprocess.call(args,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            shell=need_sh) == 0
+        proc = await asyncio.subprocess.create_subprocess_shell(args,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            shell=need_sh)
+        await proc.communicate()
+        return proc.returncode == 0
 
     def test_tcp(self):
         """
@@ -355,7 +357,7 @@ class ZK(object):
         :return: bool
         """
 
-        if not self.ommit_ping and not self.helper.test_ping():
+        if not self.ommit_ping and not await self.helper.test_ping():
             raise ZKNetworkError("can't reach device (ping %s)" % self.__address[0])
         if not self.force_udp and self.helper.test_tcp() == 0:
             self.user_packet_size = 72 # default zk8

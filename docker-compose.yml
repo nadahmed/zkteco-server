@@ -5,9 +5,6 @@ services:
       ports:
         - "8000:8000"
       volumes:
-        - "db:/code"      
+        - ".:/code"      
       network_mode: bridge
       command: ['/bin/sh','-c', '/code/init.sh']
-
-volumes:
-  db:
