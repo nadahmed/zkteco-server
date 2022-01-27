@@ -5,6 +5,7 @@ import fastapi
 import pydantic
 from device.device import Device
 import asyncio
+from sse_starlette import EventSourceResponse
 
 from device.models import DeviceModel
 
@@ -51,6 +52,8 @@ class DeviceRouter:
             ip: str
             port : typing.Optional[int] = 4370
             description: str
+
+            validate_ip = pydantic.validator('ip', allow_reuse=True)(self.validate_ip)
         
         @self._router.post("", response_model=DeviceModel ,status_code=fastapi.status.HTTP_201_CREATED)
         async def add_device(device: DeviceCreateModel):
@@ -58,7 +61,6 @@ class DeviceRouter:
             TODO: Connect device on add
             """
             try:
-                device.ip = str(ip_address(device.ip))
                 d = await DeviceModel.objects.create(**device.dict())
                 current_device = Device(**d.dict())
                 current_device.connected_task(True)
@@ -69,9 +71,12 @@ class DeviceRouter:
             except ValueError as e:
                 raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, str(e))
 
+        
         class PingAddress(pydantic.BaseModel):
             ip: str
             port: typing.Optional[int] = 4370
+
+            validate_ip = pydantic.validator('ip', allow_reuse=True)(self.validate_ip)
         
         @self._router.post("/ping", status_code=fastapi.status.HTTP_201_CREATED, summary="Ping any device")
         async def ping_device(address:PingAddress):
@@ -81,8 +86,11 @@ class DeviceRouter:
             else:
                 raise fastapi.HTTPException(detail="Failed to ping device", status_code=fastapi.status.HTTP_408_REQUEST_TIMEOUT)
 
-    def any_one(self,cls, v):
-        print("Im validating")
+    def validate_ip(self, v):
+        ip_address(v)
+        return v
+
+    def any_one(self, cls, v:typing.Dict):
         if not any(v.values()):
             raise ValueError('one of name or description must have a value')
         return v
@@ -119,7 +127,7 @@ class DeviceRouter:
             device.cancel_connected_task()
             return fastapi.responses.JSONResponse({"id": str(device.id)}, status_code=fastapi.status.HTTP_202_ACCEPTED)
         
-        @self._sub_router.get("/stream")
+        @self._sub_router.get("/stream", openapi_extra={"method":"Eventsource"})
         async def live_capture(device: Device = fastapi.Depends(self._device_check)):
             import json
             async def get_value():
@@ -127,10 +135,11 @@ class DeviceRouter:
                 try:
                     device.live_events.append(q)
                     while True:
-                        yield json.dumps(await q.get()) + "\n"
+                        yield json.dumps(await q.get())
                 finally:
                     device.live_events.remove(q)
-            return fastapi.responses.StreamingResponse(get_value(), media_type='application/json')
+            return EventSourceResponse(get_value())
+            # return fastapi.responses.StreamingResponse(get_value(), media_type='application/json')
 
         @self._sub_router.get("/voice/{voiceId}", summary="Voice")
         async def test_voice(voiceId:int, device: Device = fastapi.Depends(self._device_check)):        
