@@ -1,3 +1,4 @@
+from datetime import datetime
 from ipaddress import ip_address
 from sqlite3 import IntegrityError
 import typing
@@ -6,11 +7,13 @@ import pydantic
 from device.device import Device
 import asyncio
 from sse_starlette import EventSourceResponse
+from contextlib import ExitStack
 
 from device.models import DeviceModel
 
 import zk
 from zk.base import ZK_helper
+from zk.exception import ZKErrorConnection
 
 class DeviceRouter:
     def __init__(self, devices: typing.List[Device]):
@@ -27,12 +30,20 @@ class DeviceRouter:
         self._setupSubRouter()
         self._router.include_router(self._sub_router)
 
-    def _device_check(self, deviceId: str = fastapi.Path(...)):
+    async def catch_exceptions_middleware(self, request: fastapi.Request, call_next):
+        try:
+            return await call_next(request)
+        except ZKErrorConnection:
+            # you probably want some kind of logging here
+            return fastapi.Response("Device not connected middleware", status_code=500)
+
+    def _device_check(self, deviceId: int = fastapi.Path(...)):
         try:
             device = [el for el in self._devices if el.id == deviceId][0]
         except IndexError:
             raise fastapi.HTTPException(404, detail="device not found")
-
+        if not device._connection.is_connect:
+            raise fastapi.HTTPException(404, detail="device not connected")
         if device._device_lock.locked():
             raise fastapi.HTTPException(detail={"error": "Device is busy"}, status_code=423)
         return device
@@ -40,6 +51,7 @@ class DeviceRouter:
 
     def getRouter(self):
         return self._router
+
 
     def _setupRouter(self):
         @self._router.get("", response_model=typing.List[DeviceModel])
@@ -63,13 +75,40 @@ class DeviceRouter:
             try:
                 d = await DeviceModel.objects.create(**device.dict())
                 current_device = Device(**d.dict())
-                current_device.connected_task(True)
+                current_device.keep_trying_connection_task(True)
                 self._devices.append(current_device)
                 return d
             except IntegrityError as e:
                 raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, str(e))
             except ValueError as e:
                 raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, str(e))
+        
+        class StatusModel(pydantic.BaseModel):
+            id:int
+            connected:bool
+            timestamp: datetime
+
+        @self._router.get('/status', response_model=typing.List[StatusModel])
+        async def connection_status():
+            payload: typing.List[StatusModel] = []
+            for device in self._devices:
+                item = StatusModel(id=device.id, connected=device._connection.is_connect, timestamp=device.modified_time)
+                payload.append(item)
+            return payload
+
+        @self._router.get("/event/status", response_model=StatusModel, openapi_extra={"method":"Eventsource"})
+        async def status():
+            import json
+            async def get_value():
+                try:
+                    q = asyncio.Queue(len(self._devices))
+                    Device.connection_status.append(q)
+                    while True:
+                        yield json.dumps(await q.get())
+                finally:
+                    Device.connection_status.remove(q)
+            return EventSourceResponse(get_value())
+
 
         
         class PingAddress(pydantic.BaseModel):
@@ -123,11 +162,20 @@ class DeviceRouter:
             """            
 
             await DeviceModel.objects.delete(id=device.id)
-            self._devices.remove(device)
             device.cancel_connected_task()
+            self._devices.remove(device)
             return fastapi.responses.JSONResponse({"id": str(device.id)}, status_code=fastapi.status.HTTP_202_ACCEPTED)
-        
-        @self._sub_router.get("/stream", openapi_extra={"method":"Eventsource"})
+
+        class LiveCaptureModel(pydantic.BaseModel):
+            punch:typing.Literal['check_in','check_out','overtime_in','overtime_out']
+            status:bool
+            timestamp:datetime
+            uid:int
+            user_id:int
+
+
+
+        @self._sub_router.get("/event/stream", response_model=LiveCaptureModel, openapi_extra={"method":"Eventsource"})
         async def live_capture(device: Device = fastapi.Depends(self._device_check)):
             import json
             async def get_value():
@@ -135,7 +183,8 @@ class DeviceRouter:
                 try:
                     device.live_events.append(q)
                     while True:
-                        yield json.dumps(await q.get())
+                        data = await q.get()
+                        yield LiveCaptureModel(**data).json()
                 finally:
                     device.live_events.remove(q)
             return EventSourceResponse(get_value())
@@ -289,8 +338,9 @@ class DeviceRouter:
         @self._sub_router.on_event("startup")
         async def bg_task():
             for device in self._devices:
-                device.connected_task(True)
-
+                # device.connected_task(True)
+                device.keep_trying_connection_task(True)
+        
         @self._sub_router.on_event("shutdown")
         async def clean_up():
             for device in self._devices:

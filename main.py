@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from device.device_router import DeviceRouter
 from device.db_connection import database
 from device.models import DeviceModel
+import zk
 
 
 app = fastapi.FastAPI()
@@ -39,13 +40,19 @@ async def startup() -> None:
         d = Device(**device.dict())
         devices.append(d)
     dr = DeviceRouter(devices)
-
+    
 @app.on_event("shutdown")
 async def shutdown() -> None:
     database_:Database = app.state.database
     if database_.is_connected:
         await database_.disconnect()
 
+@app.exception_handler(zk.base.ZKErrorConnection)
+async def unicorn_exception_handler(request: fastapi.Request, exc: zk.base.ZKErrorConnection):
+    return fastapi.responses.JSONResponse(
+        status_code=418,
+        content={"detail": f"Oops! We failed to communicate with the device."},
+    )
 
 @app.middleware("http")
 async def timeout_middleware(request: fastapi.Request, call_next):

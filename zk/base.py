@@ -7,6 +7,8 @@ import codecs
 
 from asyncio.exceptions import CancelledError
 
+from sqlalchemy import false
+
 from . import const
 from .attendance import Attendance
 from .exception import ZKErrorConnection, ZKErrorResponse, ZKNetworkError
@@ -165,6 +167,8 @@ class ZK(object):
         self.next_user_id='1'
         self.user_packet_size = 28 # default zk6
         self.end_live_capture = True
+        self.__sock_writer = None
+        self.__sock_reader = None
 
     def __nonzero__(self):
         """
@@ -238,15 +242,17 @@ class ZK(object):
         """
         send command to the terminal
         """
+        if self.__sock_writer == None or self.__sock_writer.is_closing():
+            raise ZKErrorConnection("Socket not connected")
         if command not in [const.CMD_CONNECT, const.CMD_AUTH] and not self.is_connect:
             raise ZKErrorConnection("instance are not connected.")
-
         buf = self.__create_header(command, command_string, self.__session_id, self.__reply_id)
         try:
             top = self.__create_tcp_top(buf)
             self.__sock_writer.write(top)
             await self.__sock_writer.drain()
-            self.__tcp_data_recv = await self.__sock_reader.read(response_size + 8)
+            if(command != const.CMD_EXIT):
+                self.__tcp_data_recv = await self.__sock_reader.read(response_size + 8)
             self.__tcp_length = self.__test_tcp_top(self.__tcp_data_recv)
             if self.__tcp_length == 0:
                 raise ZKNetworkError("TCP packet invalid")
@@ -385,15 +391,15 @@ class ZK(object):
 
         :return: bool
         """
-        cmd_response = await self.__send_command(const.CMD_EXIT)
-        if cmd_response.get('status'):
-            self.is_connect = False
-            if self.__sock_writer:
-                self.__sock_writer.close()
-                await self.__sock_writer.wait_closed()
-            return True
-        else:
-            raise ZKErrorResponse("can't disconnect")
+        # self.__sock_reader.set_exception(Exception("Not connected"))
+        await self.__send_command(const.CMD_EXIT)
+        self.is_connect = False
+        if self.__sock_writer:
+            self.__sock_writer.close()
+            await self.__sock_writer.wait_closed()
+            print("Closed socker writer")
+        return True
+            # raise ZKErrorResponse("can't disconnect")
 
     async def enable_device(self):
         """
@@ -1219,15 +1225,16 @@ class ZK(object):
 
 
     async def close_live_capture(self):
-        self.end_live_capture = True
-        self.__live_event.set()
-        self.__live_event_closed.clear()
-        await self.__live_event_closed.wait()
+        if not self.end_live_capture:
+            self.__live_event.set()
+            self.__live_event_closed.clear()
+            await self.__live_event_closed.wait()
             
     async def live_capture(self):
         """
         try live capture of events
         """
+        self.end_live_capture = False
         was_enabled = self.is_enabled
         users = await self.get_users()
         await self.cancel_capture()
@@ -1236,12 +1243,13 @@ class ZK(object):
             await self.enable_device()
         if self.verbose: print ("start live_capture")
         await self.reg_event(const.EF_ATTLOG)
-        self.end_live_capture = False
         cancellation_task = asyncio.create_task(self.__live_event.wait())
+        
         while True:
             try:
                 reader_task = asyncio.create_task(self.__sock_reader.read(1032))
                 done, _ = await asyncio.wait({reader_task, cancellation_task}, return_when=asyncio.FIRST_COMPLETED)
+                
                 if cancellation_task in done:
                     reader_task.cancel()
                     try:
@@ -1289,6 +1297,7 @@ class ZK(object):
             except (KeyboardInterrupt, SystemExit):
                 if self.verbose: print ("break")
                 break
+        self.end_live_capture = True
         self.__live_event_closed.set()
         self.__live_event.clear()
         if self.verbose: print ("exit gracefully")
