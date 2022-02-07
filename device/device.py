@@ -1,8 +1,6 @@
 import asyncio
 import typing
-from uuid import UUID
 import datetime
-from aiosqlite import connect
 import zk
 from zk.base import ZK_helper
 
@@ -46,8 +44,6 @@ class Device:
                         await q.put(data)
 
             print("Should release lock")
-            # lock.release()
-            # print("Released Locking for Live capture")
             print("Live capture ended")   
 
     def live_capture_start_task(self):
@@ -111,23 +107,11 @@ class Device:
         await self._connection.enable_device()
         if live_capture:
             self.live_capture_start_task()
-        # except zk.base.ZKNetworkError as e:
-        #     print(e)
-        #     print("Trying to connect again in 5 sec")
-        #     raise
         return self
 
     async def clean_up(self):
         if self._connection is not None and self._connection.is_connect is False:
             await self._connection.disconnect()
-        
-    # def _setupApp(self):
-        # @self._app.middleware("http")
-        # async def _device_lock_middleware(request: fastapi.Request, call_next):
-        #     if self._device_lock.locked():
-        #         return fastapi.responses.JSONResponse({"error": "Device is busy"}, status_code=423)
-        #     response = await call_next(request)
-        #     return response
 
     def __str__(self) -> str:
         return "Device: "+ self.name

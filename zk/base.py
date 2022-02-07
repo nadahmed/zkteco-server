@@ -238,41 +238,6 @@ class ZK(object):
             return tcp_header[2]
         return 0
 
-    async def __send_command(self, command, command_string=b'', response_size=8):
-        """
-        send command to the terminal
-        """
-        if self.__sock_writer == None or self.__sock_writer.is_closing():
-            raise ZKErrorConnection("Socket not connected")
-        if command not in [const.CMD_CONNECT, const.CMD_AUTH] and not self.is_connect:
-            raise ZKErrorConnection("instance are not connected.")
-        buf = self.__create_header(command, command_string, self.__session_id, self.__reply_id)
-        try:
-            top = self.__create_tcp_top(buf)
-            self.__sock_writer.write(top)
-            await self.__sock_writer.drain()
-            if(command != const.CMD_EXIT):
-                self.__tcp_data_recv = await self.__sock_reader.read(response_size + 8)
-            self.__tcp_length = self.__test_tcp_top(self.__tcp_data_recv)
-            if self.__tcp_length == 0:
-                raise ZKNetworkError("TCP packet invalid")
-            self.__header = unpack('<4H', self.__tcp_data_recv[8:16])
-            self.__data_recv = self.__tcp_data_recv[8:]
-        except Exception as e:
-            raise ZKNetworkError(str(e))
-
-        self.__response = self.__header[0]
-        self.__reply_id = self.__header[3]
-        self.__data = self.__data_recv[8:]
-        if self.__response in [const.CMD_ACK_OK, const.CMD_PREPARE_DATA, const.CMD_DATA]:
-            return {
-                'status': True,
-                'code': self.__response
-            }
-        return {
-            'status': False,
-            'code': self.__response
-        }
 
     async def __ack_ok(self):
         """
@@ -356,6 +321,42 @@ class ZK(object):
         )
         return d
 
+    async def __send_command(self, command, command_string=b'', response_size=8):
+        """
+        send command to the terminal
+        """
+        if self.__sock_writer == None or self.__sock_writer.is_closing():
+            raise ZKErrorConnection("Socket not connected")
+        if command not in [const.CMD_CONNECT, const.CMD_AUTH] and not self.is_connect:
+            raise ZKErrorConnection("instance are not connected.")
+        buf = self.__create_header(command, command_string, self.__session_id, self.__reply_id)
+        try:
+            top = self.__create_tcp_top(buf)
+            self.__sock_writer.write(top)
+            await self.__sock_writer.drain()
+            if(command != const.CMD_EXIT):
+                self.__tcp_data_recv = await self.__sock_reader.read(response_size + 8)
+            self.__tcp_length = self.__test_tcp_top(self.__tcp_data_recv)
+            if self.__tcp_length == 0:
+                raise ZKNetworkError("TCP packet invalid")
+            self.__header = unpack('<4H', self.__tcp_data_recv[8:16])
+            self.__data_recv = self.__tcp_data_recv[8:]
+        except Exception as e:
+            raise ZKNetworkError(str(e))
+
+        self.__response = self.__header[0]
+        self.__reply_id = self.__header[3]
+        self.__data = self.__data_recv[8:]
+        if self.__response in [const.CMD_ACK_OK, const.CMD_PREPARE_DATA, const.CMD_DATA]:
+            return {
+                'status': True,
+                'code': self.__response
+            }
+        return {
+            'status': False,
+            'code': self.__response
+        }
+        
     async def connect(self):
         """
         connect to the device

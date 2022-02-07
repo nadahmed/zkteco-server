@@ -83,6 +83,39 @@ class DeviceRouter:
             except ValueError as e:
                 raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, str(e))
         
+        class DeviceUpdateModel(pydantic.BaseModel):
+            name: typing.Optional[str] = None
+            description: typing.Optional[str] = None
+
+            any_one = pydantic.root_validator(allow_reuse=True)(self.any_one)
+
+        @self._sub_router.put("/{deviceId}", response_model=DeviceModel ,status_code=fastapi.status.HTTP_202_ACCEPTED)
+        async def update_device(deviceModel: DeviceUpdateModel, deviceId: int):
+            try:
+                d = await DeviceModel.objects.get_or_none(id=deviceId)
+                if d is not None:
+                    d.name = deviceModel.name if deviceModel.name else d.name
+                    d.description = deviceModel.description if deviceModel.description else d.description
+                    return await d.update()
+                raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, "Device does not exist.")
+            except IntegrityError as e:
+                raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, str(e))
+
+        @self._sub_router.delete("/{deviceId}")
+        async def remove_device(deviceId: int):
+            """
+            TODO: Disconnect device and remove from array         
+            """            
+
+            await DeviceModel.objects.delete(id=deviceId)
+            try:
+                device = [el for el in self._devices if el.id == deviceId][0]
+            except IndexError:
+                raise fastapi.HTTPException(404, detail="device not found")
+            device.cancel_connected_task()
+            self._devices.remove(device)
+            return fastapi.responses.JSONResponse({"id": str(device.id)}, status_code=fastapi.status.HTTP_202_ACCEPTED)
+        
         class StatusModel(pydantic.BaseModel):
             id:int
             connected:bool
@@ -114,7 +147,7 @@ class DeviceRouter:
         class PingAddress(pydantic.BaseModel):
             ip: str
             port: typing.Optional[int] = 4370
-
+            
             validate_ip = pydantic.validator('ip', allow_reuse=True)(self.validate_ip)
         
         @self._router.post("/ping", status_code=fastapi.status.HTTP_201_CREATED, summary="Ping any device")
@@ -135,36 +168,6 @@ class DeviceRouter:
         return v
 
     def _setupSubRouter(self):
-
-        class DeviceUpdateModel(pydantic.BaseModel):
-            name: typing.Optional[str] = None
-            description: typing.Optional[str] = None
-
-            any_one = pydantic.root_validator(allow_reuse=True)(self.any_one)
-
-
-        @self._sub_router.put("", response_model=DeviceModel ,status_code=fastapi.status.HTTP_202_ACCEPTED)
-        async def update_device(deviceModel: DeviceUpdateModel, device: Device = fastapi.Depends(self._device_check)):
-            try:
-                d = await DeviceModel.objects.get_or_none(id=device.id)
-                if d is not None:
-                    d.name = deviceModel.name if deviceModel.name else d.name
-                    d.description = deviceModel.description if deviceModel.description else d.description
-                    return await d.update()
-                raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, "Device does not exist.")
-            except IntegrityError as e:
-                raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, str(e))
-
-        @self._sub_router.delete("")
-        async def remove_device(device: Device = fastapi.Depends(self._device_check)):
-            """
-            TODO: Disconnect device and remove from array         
-            """            
-
-            await DeviceModel.objects.delete(id=device.id)
-            device.cancel_connected_task()
-            self._devices.remove(device)
-            return fastapi.responses.JSONResponse({"id": str(device.id)}, status_code=fastapi.status.HTTP_202_ACCEPTED)
 
         class LiveCaptureModel(pydantic.BaseModel):
             punch:typing.Literal['check_in','check_out','overtime_in','overtime_out']
