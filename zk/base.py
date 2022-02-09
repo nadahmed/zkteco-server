@@ -11,7 +11,7 @@ from sqlalchemy import false
 
 from . import const
 from .attendance import Attendance
-from .exception import ZKErrorConnection, ZKErrorResponse, ZKNetworkError
+from .exception import ZKConnectionLostError, ZKErrorConnection, ZKErrorResponse, ZKNetworkError
 from .user import User
 from .finger import Finger
 import asyncio
@@ -112,6 +112,23 @@ class ZK_helper(object):
         self.client = socket(AF_INET, SOCK_DGRAM)
         self.client.settimeout(10)
 
+# class EchoClientProtocol(asyncio.Protocol):
+#     # pass
+#     # def __init__(self) -> None:
+#     #     # super.__init__()
+#     #     self.zk = zk
+#     #     # self.zk.is_connect = False
+
+#     def connection_made(self, transport:asyncio.WriteTransport):
+#         # super.connection_made(transport)
+#         # self.transport = transport
+#         print("Connected to server Hello")
+#         # self.zk.is_connect = True
+    
+#     def connection_lost(self, exc):
+#         # super.connection_lost(exc)
+#         print("Connection lost")
+#         # self.zk.is_connect = False
 
 class ZK(object):
     """
@@ -176,8 +193,11 @@ class ZK(object):
         """
         return self.is_connect
 
+        
     async def __create_socket(self):
+        
         self.__sock_reader, self.__sock_writer = await asyncio.open_connection(self.__address[0], self.__address[1])
+        print("Connected from zk")
         
     def __create_tcp_top(self, packet):
         """
@@ -246,8 +266,7 @@ class ZK(object):
         buf = self.__create_header(const.CMD_ACK_OK, b'', self.__session_id, const.USHRT_MAX - 1)
         try:
             top = self.__create_tcp_top(buf)
-            self.__sock_writer.write(top)
-            await self.__sock_writer.drain()
+            await self.write(top)
         except Exception as e:
             raise ZKNetworkError(str(e))
 
@@ -321,6 +340,21 @@ class ZK(object):
         )
         return d
 
+    async def write(self, data, timeout=None):
+        if timeout == None:
+            timeout = self.__timeout
+        self.__sock_writer.write(data)
+        await asyncio.wait_for(self.__sock_writer.drain(), timeout=timeout)
+
+    async def read(self, byte_size, timeout=None):
+        if timeout == None:
+            timeout = self.__timeout
+        # try:
+        return await asyncio.wait_for(self.__sock_reader.read(byte_size), timeout=timeout)
+        # return result
+        # except (CancelledError, asyncio.TimeoutError) as e:
+        #     # print(e)
+        #     raise ZKConnectionLostError("Device probably disconnected")
     async def __send_command(self, command, command_string=b'', response_size=8):
         """
         send command to the terminal
@@ -332,10 +366,10 @@ class ZK(object):
         buf = self.__create_header(command, command_string, self.__session_id, self.__reply_id)
         try:
             top = self.__create_tcp_top(buf)
-            self.__sock_writer.write(top)
-            await self.__sock_writer.drain()
+
+            await self.write(top)
             if(command != const.CMD_EXIT):
-                self.__tcp_data_recv = await self.__sock_reader.read(response_size + 8)
+                self.__tcp_data_recv = await self.read(response_size + 8)
             self.__tcp_length = self.__test_tcp_top(self.__tcp_data_recv)
             if self.__tcp_length == 0:
                 raise ZKNetworkError("TCP packet invalid")
@@ -363,15 +397,20 @@ class ZK(object):
 
         :return: bool
         """
-
+        print("Trying to ping")
         if not self.ommit_ping and not await self.helper.test_ping():
+            if self.verbose: print("Can't reach device")
             raise ZKNetworkError("can't reach device (ping %s)" % self.__address[0])
         if not self.force_udp and self.helper.test_tcp() == 0:
             self.user_packet_size = 72 # default zk8
+        print("Ping success")
         await self.__create_socket()
+        print("Break out")
         self.__session_id = 0
         self.__reply_id = const.USHRT_MAX - 1
+        print("Trying to send command")
         cmd_response = await self.__send_command(const.CMD_CONNECT)
+        print("Sent command")
         self.__session_id = self.__header[2]
         if cmd_response.get('code') == const.CMD_ACK_UNAUTH:
             if self.verbose: print ("try auth")
@@ -398,7 +437,6 @@ class ZK(object):
         if self.__sock_writer:
             self.__sock_writer.close()
             await self.__sock_writer.wait_closed()
-            print("Closed socker writer")
         return True
             # raise ZKErrorResponse("can't disconnect")
 
@@ -1191,7 +1229,7 @@ class ZK(object):
             command_string = pack('<24sbb',str(user_id).encode(), temp_id, 1)
         else:
             command_string = pack('<Ib', int(user_id), temp_id)
-        self.cancel_capture()
+        await self.cancel_capture()
         cmd_response = await self.__send_command(command, command_string)
         if not cmd_response.get('status'):
             raise ZKErrorResponse("Cant Enroll user #%i [%i]" %(uid, temp_id))
@@ -1202,7 +1240,7 @@ class ZK(object):
             if attempts==3:
                 attempts = 0
             if self.verbose: print(f"Attempt #{attempts} at finger input")
-            data_recv = await self.__sock_reader.read(1032)
+            data_recv = await self.read(1032, 60)
             await self.__ack_ok()
             data_recv = codecs.encode(data_recv,'hex')
             if self.verbose: print(data_recv)
@@ -1248,7 +1286,7 @@ class ZK(object):
         
         while True:
             try:
-                reader_task = asyncio.create_task(self.__sock_reader.read(1032))
+                reader_task = asyncio.create_task(self.read(1032, 5))
                 done, _ = await asyncio.wait({reader_task, cancellation_task}, return_when=asyncio.FIRST_COMPLETED)
                 
                 if cancellation_task in done:
@@ -1260,7 +1298,10 @@ class ZK(object):
                     finally:
                         break
                 task = done.pop()
-                data_recv = task.result()
+                try:
+                    data_recv = task.result()
+                except asyncio.TimeoutError:
+                    continue
                 await self.__ack_ok()
                 size = unpack('<HHI', data_recv[:8])[2]
                 header = unpack('HHHH', data_recv[8:16])
@@ -1321,7 +1362,7 @@ class ZK(object):
         else:
             raise ZKErrorResponse("can't clear data")
 
-    def __recieve_tcp_data(self, data_recv, size):
+    async def __recieve_tcp_data(self, data_recv, size):
         """ data_recv, raw tcp packet
          must analyze tcp_length
 
@@ -1335,13 +1376,13 @@ class ZK(object):
             return None, b""
         if (tcp_length - 8) < size:
             if self.verbose: print ("tcp length too small... retrying")
-            resp, bh = self.__recieve_tcp_data(data_recv, tcp_length - 8)
+            resp, bh = await self.__recieve_tcp_data(data_recv, tcp_length - 8)
             data.append(resp)
             size -= len(resp)
             if self.verbose: print ("new tcp DATA packet to fill misssing {}".format(size))
-            data_recv = bh + self.__sock_reader.read(size + 16 )
+            data_recv = bh + await self.read(size + 16)
             if self.verbose: print ("new tcp DATA starting with {} bytes".format(len(data_recv)))
-            resp, bh = self.__recieve_tcp_data(data_recv, size)
+            resp, bh = await self.__recieve_tcp_data(data_recv, size)
             data.append(resp)
             if self.verbose: print ("for misssing {} recieved {} with extra {}".format(size, len(resp), len(bh)))
             return b''.join(data), bh
@@ -1374,7 +1415,7 @@ class ZK(object):
         data = []
         if self.verbose: print ("expecting {} bytes raw data".format(size))
         while size > 0:
-            data_recv = await self.__sock_reader.read(size)
+            data_recv = await self.read(size)
             recieved = len(data_recv)
             if self.verbose: print ("partial recv {}".format(recieved))
             if recieved < 100 and self.verbose: print ("   recv {}".format(codecs.encode(data_recv, 'hex')))
@@ -1407,18 +1448,18 @@ class ZK(object):
                 if len(self.__data) >= (8 + size):
                     data_recv = self.__data[8:]
                 else:
-                    data_recv = self.__data[8:] + await self.__sock_reader.read(size + 32)
-                resp, broken_header = self.__recieve_tcp_data(data_recv, size)
+                    data_recv = self.__data[8:] + await self.read(size + 32)
+                resp, broken_header = await self.__recieve_tcp_data(data_recv, size)
                 data.append(resp)
                 # get CMD_ACK_OK
                 if len(broken_header) < 16:
-                    data_recv = broken_header + await self.__sock_reader.read(16)
+                    data_recv = broken_header + await self.read(16)
                 else:
                     data_recv = broken_header
                 if len(data_recv) < 16:
                     print ("trying to complete broken ACK %s /16" % len(data_recv))
                     if self.verbose: print (data_recv.encode('hex'))
-                    data_recv += await self.__sock_reader.read(16 - len(data_recv)) #TODO: CHECK HERE_!
+                    data_recv += await self.read(16 - len(data_recv)) #TODO: CHECK HERE_!
                 if not self.__test_tcp_top(data_recv):
                     if self.verbose: print ("invalid chunk tcp ACK OK")
                     return None
@@ -1432,7 +1473,7 @@ class ZK(object):
 
                 return resp
             while True:
-                data_recv = await self.__sock_reader.read(1024+8)
+                data_recv = await self.read(1024+8)
                 response = unpack('<4H', data_recv[:8])[0]
                 if self.verbose: print ("# packet response is: {}".format(response))
                 if response == const.CMD_DATA:

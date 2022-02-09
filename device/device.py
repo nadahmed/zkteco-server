@@ -14,7 +14,7 @@ class Device:
         self.description = description
         self.ip = ip
         self.port = port
-        self._connection = zk.ZK(self.ip, port=self.port, timeout=5, password=0, ommit_ping=False, verbose= True)
+        self._connection = zk.ZK(self.ip, port=self.port, timeout=10, password=0, ommit_ping=True, verbose= True)
         self._live_capture_lock = asyncio.Lock()
         self._device_lock = asyncio.Lock()
         self.live_events: typing.List[asyncio.Queue] = []
@@ -30,7 +30,6 @@ class Device:
                 print("Starting Live Capture")                  
                 async for attendance in self._connection.live_capture():
                     punch =['check_in','check_out',None,None,'overtime_in','overtime_out']
-                    print(attendance.punch)
                     data = {
                             "punch": punch[attendance.punch],
                             "status": attendance.status,
@@ -56,53 +55,53 @@ class Device:
             self.live_capture_task.cancel()
 
     def connected_task(self, live_capture=False):
-        if self.connection_task==None or self.connection_task.cancelled():
-            self.connection_task = asyncio.create_task(self.keep_connecting(live_capture))
+        # if self.connection_task==None or self.connection_task.cancelled():
+        # self.connection_task = 
+        self.connection_task = asyncio.create_task(self.keep_connecting(live_capture))
+        
+        # self.connection_task.
+        print("Created connection task")
+        return self.connection_task
     
     def cancel_connected_task(self):
         self.live_capture_cancel_task()
         if self.connection_task!=None and not self.connection_task.cancelled():
             self.connection_task.cancel()
 
-    def keep_trying_connection_task(self, live_capture=False):
-        self.connection_task = asyncio.create_task(self.ping_keep_connecting(live_capture))
+    # def keep_trying_connection_task(self, live_capture=False):
+    #     self.connection_task = asyncio.create_task(self.ping_keep_connecting(live_capture))
 
-    async def ping_keep_connecting(self, live_capture = False):
-        h = ZK_helper(self.ip, self.port)
-        flag = -1
-        while True:
-            connected = await h.test_ping()
-            print("Pinging device")
-            if connected:
-                if not self._connection.is_connect:
-                    await self.connect(live_capture)
-            else:
-                print("Ping Failed")
-                print("Is connect:", self._connection.is_connect)
-                if self._connection.is_connect:
-                    print("Trying to close live capture on lost connection")
-                    await self._connection.close_live_capture()
-                    self.live_capture_cancel_task()
-                    await self._connection.disconnect()
+    # async def ping_keep_connecting(self, live_capture = False):
+    #     h = ZK_helper(self.ip, self.port)
+    #     flag = -1
+    #     while True:
+    #         connected = await h.test_ping()
+    #         print("Pinging device")
+    #         if connected:
+    #             if not self._connection.is_connect:
+    #                 await self.connect(live_capture)
+    #         else:
+    #             print("Ping Failed")
+    #             print("Is connect:", self._connection.is_connect)
+    #             if self._connection.is_connect:
+    #                 print("Trying to close live capture on lost connection")
+    #                 await self._connection.close_live_capture()
+    #                 self.live_capture_cancel_task()
+    #                 await self._connection.disconnect()
 
-            for q in Device.connection_status:
-                print("Putting in q")
-                if flag != self._connection.is_connect:
-                    flag = self._connection.is_connect
-                    self.modified_time = datetime.datetime.now()#.isoformat()
-                    await q.put({"id":self.id, "connected":flag, 'timestamp':self.modified_time})
-            await asyncio.sleep(5)
+    #         for q in Device.connection_status:
+    #             print("Putting in q")
+    #             if flag != self._connection.is_connect:
+    #                 flag = self._connection.is_connect
+    #                 self.modified_time = datetime.datetime.now()#.isoformat()
+    #                 await q.put({"id":self.id, "connected":flag, 'timestamp':self.modified_time})
+    #         await asyncio.sleep(5)
 
     async def keep_connecting(self, live_capture = False):
-        while True:
-            try:
-                await self.connect(live_capture)
-                break
-            except zk.base.ZKNetworkError:
-                await asyncio.sleep(5)
-
+            await self.connect(live_capture)
+            print("Connected!!!")
+        
     async def connect(self, live_capture=False):
-        # try:
         await self._connection.connect()
         await self._connection.enable_device()
         if live_capture:

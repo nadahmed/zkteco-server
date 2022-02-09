@@ -7,7 +7,6 @@ import pydantic
 from device.device import Device
 import asyncio
 from sse_starlette import EventSourceResponse
-from contextlib import ExitStack
 
 from device.models import DeviceModel
 
@@ -89,7 +88,7 @@ class DeviceRouter:
 
             any_one = pydantic.root_validator(allow_reuse=True)(self.any_one)
 
-        @self._sub_router.put("/{deviceId}", response_model=DeviceModel ,status_code=fastapi.status.HTTP_202_ACCEPTED)
+        @self._router.put("/{deviceId}", response_model=DeviceModel ,status_code=fastapi.status.HTTP_202_ACCEPTED)
         async def update_device(deviceModel: DeviceUpdateModel, deviceId: int):
             try:
                 d = await DeviceModel.objects.get_or_none(id=deviceId)
@@ -101,7 +100,7 @@ class DeviceRouter:
             except IntegrityError as e:
                 raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, str(e))
 
-        @self._sub_router.delete("/{deviceId}")
+        @self._router.delete("/{deviceId}")
         async def remove_device(deviceId: int):
             """
             TODO: Disconnect device and remove from array         
@@ -341,8 +340,17 @@ class DeviceRouter:
         @self._sub_router.on_event("startup")
         async def bg_task():
             for device in self._devices:
-                # device.connected_task(True)
-                device.keep_trying_connection_task(True)
+                print(f"Connecting to device {device.id}")
+                task = device.connected_task(True)
+                
+                try:
+                    await task
+                except OSError as e:
+                    if e.errno == 113:
+                        print(f"Could not connect")
+                    else:
+                        raise
+                # device.keep_trying_connection_task(True)
         
         @self._sub_router.on_event("shutdown")
         async def clean_up():

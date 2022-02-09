@@ -13,3 +13,6 @@ class ZKErrorResponse(ZKError):
 
 class ZKNetworkError(ZKError):
     pass
+
+class ZKConnectionLostError(ZKError):
+    pass
