@@ -341,15 +341,8 @@ class DeviceRouter:
         async def bg_task():
             for device in self._devices:
                 print(f"Connecting to device {device.id}")
-                task = device.connected_task(True)
+                device.connected_task(True)
                 
-                try:
-                    await task
-                except OSError as e:
-                    if e.errno == 113:
-                        print(f"Could not connect")
-                    else:
-                        raise
                 # device.keep_trying_connection_task(True)
         
         @self._sub_router.on_event("shutdown")

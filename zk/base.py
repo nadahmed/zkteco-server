@@ -112,23 +112,7 @@ class ZK_helper(object):
         self.client = socket(AF_INET, SOCK_DGRAM)
         self.client.settimeout(10)
 
-# class EchoClientProtocol(asyncio.Protocol):
-#     # pass
-#     # def __init__(self) -> None:
-#     #     # super.__init__()
-#     #     self.zk = zk
-#     #     # self.zk.is_connect = False
 
-#     def connection_made(self, transport:asyncio.WriteTransport):
-#         # super.connection_made(transport)
-#         # self.transport = transport
-#         print("Connected to server Hello")
-#         # self.zk.is_connect = True
-    
-#     def connection_lost(self, exc):
-#         # super.connection_lost(exc)
-#         print("Connection lost")
-#         # self.zk.is_connect = False
 
 class ZK(object):
     """
@@ -196,9 +180,33 @@ class ZK(object):
         
     async def __create_socket(self):
         
-        self.__sock_reader, self.__sock_writer = await asyncio.open_connection(self.__address[0], self.__address[1])
-        print("Connected from zk")
+        class CustomStreamReaderProtocol(asyncio.StreamReaderProtocol):
+            def __init__(self, reader, client_disconnected_cb=None, *args, **kwargs) -> None:
+                
+                super().__init__(reader, *args, **kwargs)
+                self._client_disconnected_cb = client_disconnected_cb
+            
+            def connection_lost(self, exc):
+                super().connection_lost(exc)
+                if self._client_disconnected_cb != None:
+                    self._client_disconnected_cb()
+
+        def connected_cb(*args, **kwargs):
+            print("I am connected!!")
         
+        def disconnected_cb(*args, **kwargs):
+            self.is_connect = False
+            print("I am not connected anymore!!")
+
+        loop = asyncio.get_event_loop()
+        reader = asyncio.StreamReader(limit=2**16, loop=loop)
+        protocol = CustomStreamReaderProtocol(reader, client_disconnected_cb=disconnected_cb, client_connected_cb=connected_cb, loop=loop)
+        transport, protocol = await loop.create_connection(
+            lambda: protocol, self.__address[0], self.__address[1])
+        writer = asyncio.StreamWriter(transport, protocol, reader, loop)
+        self.__sock_reader, self.__sock_writer =  reader, writer
+
+    
     def __create_tcp_top(self, packet):
         """
         witch the complete packet set top header
@@ -344,17 +352,21 @@ class ZK(object):
         if timeout == None:
             timeout = self.__timeout
         self.__sock_writer.write(data)
-        await asyncio.wait_for(self.__sock_writer.drain(), timeout=timeout)
+        try:
+            await asyncio.wait_for(self.__sock_writer.drain(), timeout=timeout)
+        except asyncio.TimeoutError:
+            self.__sock_writer.close()
+            await self.__sock_writer.wait_closed()
 
     async def read(self, byte_size, timeout=None):
         if timeout == None:
             timeout = self.__timeout
-        # try:
-        return await asyncio.wait_for(self.__sock_reader.read(byte_size), timeout=timeout)
-        # return result
-        # except (CancelledError, asyncio.TimeoutError) as e:
-        #     # print(e)
-        #     raise ZKConnectionLostError("Device probably disconnected")
+        try:
+            return await asyncio.wait_for(self.__sock_reader.read(byte_size), timeout=timeout)
+        except asyncio.TimeoutError:
+            self.__sock_writer.close()
+            await self.__sock_writer.wait_closed()
+    
     async def __send_command(self, command, command_string=b'', response_size=8):
         """
         send command to the terminal
@@ -397,20 +409,15 @@ class ZK(object):
 
         :return: bool
         """
-        print("Trying to ping")
         if not self.ommit_ping and not await self.helper.test_ping():
             if self.verbose: print("Can't reach device")
             raise ZKNetworkError("can't reach device (ping %s)" % self.__address[0])
         if not self.force_udp and self.helper.test_tcp() == 0:
             self.user_packet_size = 72 # default zk8
-        print("Ping success")
         await self.__create_socket()
-        print("Break out")
         self.__session_id = 0
         self.__reply_id = const.USHRT_MAX - 1
-        print("Trying to send command")
         cmd_response = await self.__send_command(const.CMD_CONNECT)
-        print("Sent command")
         self.__session_id = self.__header[2]
         if cmd_response.get('code') == const.CMD_ACK_UNAUTH:
             if self.verbose: print ("try auth")
@@ -1286,7 +1293,7 @@ class ZK(object):
         
         while True:
             try:
-                reader_task = asyncio.create_task(self.read(1032, 5))
+                reader_task = asyncio.create_task(asyncio.wait_for(self.__sock_reader.read(1032), timeout=3))
                 done, _ = await asyncio.wait({reader_task, cancellation_task}, return_when=asyncio.FIRST_COMPLETED)
                 
                 if cancellation_task in done:
@@ -1300,8 +1307,14 @@ class ZK(object):
                 task = done.pop()
                 try:
                     data_recv = task.result()
+                    # data_recv = await asyncio.wait_for(self.__sock_reader.read(1032), timeout=3)
                 except asyncio.TimeoutError:
-                    continue
+                    try:
+                        await self.free_data()
+                        continue
+                    except:
+                        break
+
                 await self.__ack_ok()
                 size = unpack('<HHI', data_recv[:8])[2]
                 header = unpack('HHHH', data_recv[8:16])

@@ -8,7 +8,7 @@ from device.device_router import DeviceRouter
 from device.db_connection import database
 from device.models import DeviceModel
 import zk
-from zk.exception import ZKConnectionLostError, ZKNetworkError
+from zk.exception import ZKConnectionLostError, ZKError, ZKNetworkError
 
 
 app = fastapi.FastAPI()
@@ -48,8 +48,8 @@ async def shutdown() -> None:
     if database_.is_connected:
         await database_.disconnect()
 
-@app.exception_handler(asyncio.TimeoutError)
-async def unicorn_exception_handler(request: fastapi.Request, exc: asyncio.TimeoutError):
+@app.exception_handler(ZKError)
+async def unicorn_exception_handler(request: fastapi.Request, exc: ZKError):
     return fastapi.responses.JSONResponse(
         status_code=418,
         content={"detail": f"Oops! We failed to communicate with the device."},
