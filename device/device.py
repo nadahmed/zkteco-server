@@ -80,6 +80,7 @@ class Device:
     async def keep_connecting(self, live_capture = False):
         flag = -1
         while True:
+            print("Is connected", self._connection.is_connect)
             if not self._connection.is_connect:
                 try:
                     loop = asyncio.get_running_loop()
@@ -87,7 +88,10 @@ class Device:
                     
                     await self._connection.close_live_capture()
                     self.live_capture_cancel_task()
-                    await asyncio.wait_for(loop.create_task(self.connect(live_capture)), timeout=10)
+                    await asyncio.wait_for(loop.create_task(self._connection.connect()), timeout=10)
+                    await self._connection.enable_device()
+                    if live_capture:
+                        self.live_capture_start_task()
                     print("Connected!!!")
 
                 except asyncio.TimeoutError:
@@ -98,20 +102,20 @@ class Device:
                     else:
                         raise
 
-                for q in Device.connection_status:
-                    # if flag != self._connection.is_connect:
-                    flag = self._connection.is_connect
-                    self.modified_time = datetime.datetime.now()#.isoformat()
-                    await q.put({"id":self.id, "connected":flag, 'timestamp':self.modified_time})
+            for q in Device.connection_status:
+                # if flag != self._connection.is_connect:
+                flag = self._connection.is_connect
+                self.modified_time = datetime.datetime.now()#.isoformat()
+                await q.put({"id":self.id, "connected":flag, 'timestamp':self.modified_time})
             await asyncio.sleep(5)
 
 
         
-    async def connect(self, live_capture=False):
-        await self._connection.connect()
-        await self._connection.enable_device()
-        if live_capture:
-            await self.live_capture_start_task()
+    # async def connect(self, live_capture=False):
+    #     await self._connection.connect()
+    #     await self._connection.enable_device()
+    #     if live_capture:
+    #         await self.live_capture_start_task()
 
     async def clean_up(self):
         if self._connection is not None and self._connection.is_connect is False:

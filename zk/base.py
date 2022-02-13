@@ -195,13 +195,14 @@ class ZK(object):
                     self._client_disconnected_cb()
 
         def connected_cb(*args, **kwargs):
+            self.is_connect = True
             print("I am connected!!")
         
         def disconnected_cb(*args, **kwargs):
             self.is_connect = False
             print("I am not connected anymore!!")
 
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
         reader = asyncio.StreamReader(limit=2**16, loop=loop)
         protocol = CustomStreamReaderProtocol(reader, client_disconnected_cb=disconnected_cb, client_connected_cb=connected_cb, loop=loop)
         transport, _ = await loop.create_connection(

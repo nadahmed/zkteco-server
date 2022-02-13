@@ -117,7 +117,7 @@ class DeviceRouter:
             timestamp: datetime
 
         @self._router.get('/status', response_model=typing.List[StatusModel])
-        async def connection_status():
+        def connection_status():
             payload: typing.List[StatusModel] = []
             for device in self._devices:
                 item = StatusModel(id=device.id, connected=device._connection.is_connect, timestamp=device.modified_time)
