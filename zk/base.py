@@ -74,6 +74,7 @@ class ZK_helper(object):
         self.address = (ip, port)
         self.ip = ip
         self.port = port
+        self.client = None
 
     async def test_ping(self):
         """
@@ -94,16 +95,18 @@ class ZK_helper(object):
         await proc.communicate()
         return proc.returncode == 0
 
-    def test_tcp(self):
+    async def test_tcp(self):
         """
         test TCP connection
         """
-
-        self.client = socket(AF_INET, SOCK_STREAM)
-        self.client.settimeout(10)
-        res = self.client.connect_ex(self.address)
-        self.client.close()
-        return res
+        try:
+            self.client = await asyncio.open_connection(self.address[0],self.address[1])
+        except OSError as e:
+            return e.errno
+        finally:
+            if self.client:
+                self.client.close()    
+        return 0
 
     def test_udp(self):
         """
@@ -167,7 +170,7 @@ class ZK(object):
         self.next_uid = 1
         self.next_user_id='1'
         self.user_packet_size = 28 # default zk6
-        self.end_live_capture = True
+        self.enabled_live_capture = False
         self.__sock_writer = None
         self.__sock_reader = None
 
@@ -182,7 +185,6 @@ class ZK(object):
         
         class CustomStreamReaderProtocol(asyncio.StreamReaderProtocol):
             def __init__(self, reader, client_disconnected_cb=None, *args, **kwargs) -> None:
-                
                 super().__init__(reader, *args, **kwargs)
                 self._client_disconnected_cb = client_disconnected_cb
             
@@ -198,13 +200,14 @@ class ZK(object):
             self.is_connect = False
             print("I am not connected anymore!!")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         reader = asyncio.StreamReader(limit=2**16, loop=loop)
         protocol = CustomStreamReaderProtocol(reader, client_disconnected_cb=disconnected_cb, client_connected_cb=connected_cb, loop=loop)
-        transport, protocol = await loop.create_connection(
+        transport, _ = await loop.create_connection(
             lambda: protocol, self.__address[0], self.__address[1])
         writer = asyncio.StreamWriter(transport, protocol, reader, loop)
         self.__sock_reader, self.__sock_writer =  reader, writer
+        # self.__sock_reader, self.__sock_writer =  await asyncio.open_connection(self.__address[0], self.__address[1])
 
     
     def __create_tcp_top(self, packet):
@@ -412,7 +415,7 @@ class ZK(object):
         if not self.ommit_ping and not await self.helper.test_ping():
             if self.verbose: print("Can't reach device")
             raise ZKNetworkError("can't reach device (ping %s)" % self.__address[0])
-        if not self.force_udp and self.helper.test_tcp() == 0:
+        if not self.force_udp and await self.helper.test_tcp() == 0:
             self.user_packet_size = 72 # default zk8
         await self.__create_socket()
         self.__session_id = 0
@@ -1271,7 +1274,7 @@ class ZK(object):
 
 
     async def close_live_capture(self):
-        if not self.end_live_capture:
+        if self.enabled_live_capture:
             self.__live_event.set()
             self.__live_event_closed.clear()
             await self.__live_event_closed.wait()
@@ -1280,7 +1283,7 @@ class ZK(object):
         """
         try live capture of events
         """
-        self.end_live_capture = False
+        self.enabled_live_capture = True
         was_enabled = self.is_enabled
         users = await self.get_users()
         await self.cancel_capture()
@@ -1291,7 +1294,7 @@ class ZK(object):
         await self.reg_event(const.EF_ATTLOG)
         cancellation_task = asyncio.create_task(self.__live_event.wait())
         
-        while True:
+        while self.enabled_live_capture:
             try:
                 reader_task = asyncio.create_task(asyncio.wait_for(self.__sock_reader.read(1032), timeout=3))
                 done, _ = await asyncio.wait({reader_task, cancellation_task}, return_when=asyncio.FIRST_COMPLETED)
@@ -1352,7 +1355,7 @@ class ZK(object):
             except (KeyboardInterrupt, SystemExit):
                 if self.verbose: print ("break")
                 break
-        self.end_live_capture = True
+        self.enabled_live_capture = False
         self.__live_event_closed.set()
         self.__live_event.clear()
         if self.verbose: print ("exit gracefully")

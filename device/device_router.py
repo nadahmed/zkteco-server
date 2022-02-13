@@ -42,7 +42,7 @@ class DeviceRouter:
         except IndexError:
             raise fastapi.HTTPException(404, detail="device not found")
         if not device._connection.is_connect:
-            raise fastapi.HTTPException(404, detail="device not connected")
+            raise fastapi.HTTPException(fastapi.status.HTTP_422_UNPROCESSABLE_ENTITY, detail="device not connected")
         if device._device_lock.locked():
             raise fastapi.HTTPException(detail={"error": "Device is busy"}, status_code=423)
         return device
@@ -68,17 +68,13 @@ class DeviceRouter:
         
         @self._router.post("", response_model=DeviceModel ,status_code=fastapi.status.HTTP_201_CREATED)
         async def add_device(device: DeviceCreateModel):
-            """
-            TODO: Connect device on add
-            """
+            
             try:
                 d = await DeviceModel.objects.create(**device.dict())
                 current_device = Device(**d.dict())
-                current_device.keep_trying_connection_task(True)
                 self._devices.append(current_device)
+                current_device.connected_task(True)                
                 return d
-            except IntegrityError as e:
-                raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, str(e))
             except ValueError as e:
                 raise fastapi.exceptions.HTTPException(fastapi.status.HTTP_400_BAD_REQUEST, str(e))
         
@@ -136,7 +132,7 @@ class DeviceRouter:
                     q = asyncio.Queue(len(self._devices))
                     Device.connection_status.append(q)
                     while True:
-                        yield json.dumps(await q.get())
+                        yield json.dumps(await q.get(), default=str)
                 finally:
                     Device.connection_status.remove(q)
             return EventSourceResponse(get_value())
