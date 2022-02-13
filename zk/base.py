@@ -105,7 +105,8 @@ class ZK_helper(object):
             return e.errno
         finally:
             if self.client:
-                self.client.close()    
+                self.client[1].close()
+                await self.client[1].wait_closed()    
         return 0
 
     def test_udp(self):
