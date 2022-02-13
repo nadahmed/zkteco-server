@@ -83,11 +83,12 @@ class Device:
             print("Is connected", self._connection.is_connect)
             if not self._connection.is_connect:
                 try:
+                    if self._connection.enabled_live_capture:
+                        await self._connection.close_live_capture()
+                        self.live_capture_cancel_task()
                     loop = asyncio.get_running_loop()
                     print("Trying to connect")
                     
-                    await self._connection.close_live_capture()
-                    self.live_capture_cancel_task()
                     await asyncio.wait_for(loop.create_task(self._connection.connect()), timeout=10)
                     await self._connection.enable_device()
                     if live_capture:
@@ -101,7 +102,6 @@ class Device:
                         print(f"Could not connect. Trying again in 5 seconds...")
                     else:
                         raise
-
             for q in Device.connection_status:
                 # if flag != self._connection.is_connect:
                 flag = self._connection.is_connect

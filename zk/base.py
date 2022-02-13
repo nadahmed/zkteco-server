@@ -1279,8 +1279,11 @@ class ZK(object):
         if self.enabled_live_capture:
             self.__live_event.set()
             self.__live_event_closed.clear()
-            await self.__live_event_closed.wait()
-            
+            try:
+                await asyncio.wait_for(asyncio.create_task(self.__live_event_closed.wait(), timeout=10))
+            except asyncio.TimeoutError:
+                pass
+         
     async def live_capture(self):
         """
         try live capture of events
