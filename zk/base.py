@@ -1280,7 +1280,7 @@ class ZK(object):
             self.__live_event.set()
             self.__live_event_closed.clear()
             try:
-                await asyncio.wait_for(asyncio.create_task(self.__live_event_closed.wait(), timeout=10))
+                await asyncio.wait_for(asyncio.create_task(self.__live_event_closed.wait()), timeout=10)
             except asyncio.TimeoutError:
                 pass
          
@@ -1364,7 +1364,10 @@ class ZK(object):
         self.__live_event_closed.set()
         self.__live_event.clear()
         if self.verbose: print ("exit gracefully")
-        await self.reg_event(0)
+        try:
+            await self.reg_event(0)
+        except ZKErrorConnection:
+            pass
         if not was_enabled:
             await self.disable_device()
 
