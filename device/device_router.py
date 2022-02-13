@@ -135,7 +135,7 @@ class DeviceRouter:
                         yield json.dumps(await q.get(), default=str)
                 finally:
                     Device.connection_status.remove(q)
-            return EventSourceResponse(get_value())
+            return EventSourceResponse(await get_value())
 
 
         
